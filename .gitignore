@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Simulation outputs (these are large files)
+vtk_output/
+frames_*/
+*.gif
+*.png
+*.mp4
+*.avi
+
+# Temporary files
+*.tmp
+*.log
+state_*.txt
+
+# Large data files
+*.vtp
+*.vtm
+*.vts
+*.vtk
