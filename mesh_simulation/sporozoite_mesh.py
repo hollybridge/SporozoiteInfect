@@ -12,21 +12,28 @@ import random
 from scipy.spatial.distance import cdist
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import spsolve
+import sys
+import os
+
+# Import configuration
+sys.path.append(os.path.dirname(__file__))
+from simulation_config import SimulationConfig
 
 class DeformableSporozoiteMesh:
     """
     Represents a sporozoite as a deformable polyhedral mesh
     """
     
-    def __init__(self, sporozoite_id: int, initial_position: np.ndarray):
+    def __init__(self, sporozoite_id: int, initial_position: np.ndarray, config=None):
         self.id = sporozoite_id
         self.center_position = np.array(initial_position, dtype=float)
+        self.config = config or SimulationConfig()
         
-        # Biological parameters
-        self.length = random.uniform(10.0, 15.0)  # micrometers
-        self.diameter = random.uniform(0.8, 1.2)  # micrometers
-        self.motility = random.uniform(0.6, 1.0)
-        self.stiffness = random.uniform(0.3, 0.7)  # deformation resistance
+        # Biological parameters using config
+        self.length = random.uniform(*self.config.SPOROZOITE_LENGTH_RANGE)
+        self.diameter = random.uniform(*self.config.SPOROZOITE_DIAMETER_RANGE)
+        self.motility = random.uniform(*self.config.MOTILITY_RANGE)
+        self.stiffness = random.uniform(*self.config.STIFFNESS_RANGE)
         
         # Create mesh geometry
         self.vertices = None
@@ -37,18 +44,19 @@ class DeformableSporozoiteMesh:
         # Physical state
         self.viability = 1.0
         
-        # Movement parameters
+        # Movement parameters using config
         self.direction = np.random.uniform(0, 2*np.pi)
         self.undulation_phase = random.uniform(0, 2*np.pi)
-        self.undulation_frequency = random.uniform(0.5, 1.5)  # Hz
+        self.undulation_frequency = random.uniform(*self.config.UNDULATION_FREQUENCY_RANGE)
+        self.max_speed = random.uniform(*self.config.MAX_SPEED_RANGE)
         
         self._create_sporozoite_mesh()
     
     def _create_sporozoite_mesh(self):
         """Create initial curved rod mesh representing sporozoite"""
-        # Create a curved cylindrical mesh
-        n_segments = 20  # longitudinal segments
-        n_radial = 8     # radial segments
+        # Create a curved cylindrical mesh using config parameters
+        n_segments = self.config.LONGITUDINAL_SEGMENTS
+        n_radial = self.config.RADIAL_SEGMENTS
         
         vertices = []
         faces = []
@@ -188,23 +196,23 @@ class DeformableSporozoiteMesh:
         self.rest_lengths = np.array(self.rest_lengths)
     
     def apply_tissue_forces(self, tissue_field, dt: float):
-        """Apply forces from implicit tissue field"""
+        """Apply forces from implicit tissue field using config parameters"""
         # Sample tissue properties at each vertex
         for i, vertex in enumerate(self.vertices):
             # Get tissue resistance at this location
             resistance = tissue_field.get_resistance_at_point(vertex)
             flow_field = tissue_field.get_flow_field_at_point(vertex)
             
-            # Apply resistance force (opposite to vertex velocity)
+            # Apply resistance force (opposite to vertex velocity) using config scale
             if np.linalg.norm(self.velocity[i]) > 0:
-                resistance_force = -resistance * self.velocity[i] * 0.1
+                resistance_force = -resistance * self.velocity[i] * self.config.TISSUE_RESISTANCE_SCALE
                 self.forces[i] += resistance_force
             
-            # Apply flow forces
-            self.forces[i] += flow_field * 0.05
+            # Apply flow forces using config scale
+            self.forces[i] += flow_field * self.config.TISSUE_FLOW_SCALE
     
     def apply_undulation(self, time: float):
-        """Apply undulatory motion characteristic of sporozoites"""
+        """Apply undulatory motion characteristic of sporozoites using config parameters"""
         phase = self.undulation_phase + time * self.undulation_frequency * 2 * np.pi
         
         # Apply sinusoidal undulation along the body
@@ -215,17 +223,16 @@ class DeformableSporozoiteMesh:
             body_position = np.dot(relative_pos, [1, 0, 0])  # project onto x-axis
             normalized_position = body_position / (self.length/2) if self.length > 0 else 0
             
-            # Undulation force perpendicular to body axis
-            undulation_amplitude = 0.1 * self.motility
-            undulation_y = undulation_amplitude * np.sin(phase + normalized_position * 2 * np.pi)
-            undulation_z = undulation_amplitude * np.cos(phase + normalized_position * 2 * np.pi) * 0.3
+            # Undulation force perpendicular to body axis using config parameters
+            undulation_y = self.config.UNDULATION_AMPLITUDE * np.sin(phase + normalized_position * 2 * np.pi)
+            undulation_z = self.config.UNDULATION_AMPLITUDE * np.cos(phase + normalized_position * 2 * np.pi) * 0.3
             
-            undulation_force = np.array([0, undulation_y, undulation_z]) * 10.0
+            undulation_force = np.array([0, undulation_y, undulation_z]) * self.config.UNDULATION_FORCE_SCALE * self.motility
             self.forces[i] += undulation_force
     
     def apply_internal_constraints(self):
-        """Apply spring forces to maintain mesh structure"""
-        spring_constant = self.stiffness * 50.0
+        """Apply spring forces to maintain mesh structure using config parameters"""
+        spring_constant = self.stiffness * self.config.SPRING_CONSTANT_BASE
         
         for j, (v1, v2) in enumerate(self.edge_list):
             current_vec = self.vertices[v2] - self.vertices[v1]
@@ -244,19 +251,27 @@ class DeformableSporozoiteMesh:
                 self.forces[v2] -= spring_force * 0.5
     
     def update_motion(self, dt: float, time: float):
-        """Update sporozoite motion and deformation"""
+        """Update sporozoite motion and deformation using config parameters"""
         # Clear forces
         self.forces.fill(0.0)
         
-        # Apply undulation
+        # Apply directional force FIRST for translational movement
+        directional_force = np.array([np.cos(self.direction), np.sin(self.direction), 0])
+        directional_force *= self.motility * self.config.DIRECTIONAL_FORCE_STRENGTH
+        
+        # Apply to all vertices (this creates the main forward movement)
+        for i in range(len(self.vertices)):
+            self.forces[i] += directional_force
+        
+        # Apply undulation (secondary motion for swimming realism)
         self.apply_undulation(time)
         
-        # Apply internal spring constraints
+        # Apply internal spring constraints (to maintain shape)
         self.apply_internal_constraints()
         
-        # Update vertices using explicit integration
-        mass = 0.1  # arbitrary mass units
-        damping = 0.8
+        # Update vertices using explicit integration with config parameters
+        mass = self.config.MASS
+        damping = self.config.DAMPING_FACTOR
         
         # Simple explicit integration
         acceleration = self.forces / mass
@@ -269,17 +284,11 @@ class DeformableSporozoiteMesh:
         # Recalculate normals
         self._calculate_vertex_normals()
         
-        # Random direction changes (chemotaxis/random walk)
-        if random.random() < 0.1:
-            self.direction += random.uniform(-np.pi/6, np.pi/6)
-        
-        # Apply directional force
-        directional_force = np.array([np.cos(self.direction), np.sin(self.direction), 0])
-        directional_force *= self.motility * 2.0
-        
-        # Apply to all vertices
-        for i in range(len(self.vertices)):
-            self.forces[i] += directional_force
+        # Random direction changes using config parameters
+        if random.random() < self.config.RANDOM_DIRECTION_PROBABILITY:
+            direction_change = random.uniform(-self.config.MAX_DIRECTION_CHANGE, 
+                                            self.config.MAX_DIRECTION_CHANGE)
+            self.direction += direction_change
     
     def to_vtk_polydata(self) -> vtk.vtkPolyData:
         """Convert mesh to VTK PolyData for visualization"""
