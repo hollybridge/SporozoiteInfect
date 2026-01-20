@@ -5,7 +5,7 @@ High-Resolution Mesh-Based Sporozoite Simulation
 This simulation models sporozoites as deformable polyhedral meshes moving through
 an implicit dermal tissue environment. Outputs VTK files for ParaView visualization.
 
-Author: GitHub Copilot
+Author: Holly Evans
 Date: January 2026
 """
 
@@ -372,6 +372,7 @@ class MeshBasedSporozoiteSimulation:
         
         # Write ParaView state file
         self._write_paraview_instructions()
+        self._write_paraview_state_file()
     
     def _write_sporozoite_vtk(self, step_number: int):
         """Write sporozoite mesh data to VTK"""
@@ -535,6 +536,82 @@ class MeshBasedSporozoiteSimulation:
             f.write("Data fields available:\n")
             f.write("- Sporozoites: Viability, VelocityMagnitude, Motility, SporozoiteID\n")
             f.write("- Tissue: CollagenDensity, ImmuneCellDensity, Pressure, FlowField\n")
+
+    def _write_paraview_state_file(self):
+        """Write ParaView state file for automatic setup"""
+        state_file = os.path.join(self.output_dir, "simulation_setup.pvsm")
+        
+        # This creates a ParaView state file that automatically loads and configures the visualization
+        state_content = f'''<?xml version="1.0"?>
+<ParaViewState version="5.9.0">
+  <ServerManagerState>
+    <!-- Sporozoite reader -->
+    <Proxy group="sources" type="XMLMultiBlockDataReader" id="100">
+      <Property name="FileName">
+        <Element index="0" value="{os.path.abspath(self.output_dir)}/sporozoites_*.vtm"/>
+      </Property>
+    </Proxy>
+    
+    <!-- Tissue field reader -->
+    <Proxy group="sources" type="XMLStructuredGridReader" id="200">
+      <Property name="FileName">
+        <Element index="0" value="{os.path.abspath(self.output_dir)}/tissue_field_*.vts"/>
+      </Property>
+    </Proxy>
+    
+    <!-- Sporozoite representation -->
+    <Proxy group="representations" type="GeometryRepresentation" id="101">
+      <Property name="Input" proxy="100"/>
+      <Property name="ColorArrayName">
+        <Element index="0" value="Viability"/>
+      </Property>
+      <Property name="Representation">
+        <Element index="0" value="Surface"/>
+      </Property>
+    </Proxy>
+    
+    <!-- Tissue field representation -->
+    <Proxy group="representations" type="UniformGridRepresentation" id="201">
+      <Property name="Input" proxy="200"/>
+      <Property name="ColorArrayName">
+        <Element index="0" value="CollagenDensity"/>
+      </Property>
+      <Property name="Representation">
+        <Element index="0" value="Outline"/>
+      </Property>
+    </Proxy>
+    
+    <!-- Animation settings -->
+    <Proxy group="animation" type="AnimationScene" id="300">
+      <Property name="PlayMode">
+        <Element index="0" value="Sequence"/>
+      </Property>
+      <Property name="Duration">
+        <Element index="0" value="40"/>
+      </Property>
+    </Proxy>
+    
+    <!-- Camera settings -->
+    <Proxy group="views" type="RenderView" id="400">
+      <Property name="CameraPosition">
+        <Element index="0" value="150"/>
+        <Element index="1" value="150"/>
+        <Element index="2" value="100"/>
+      </Property>
+      <Property name="CameraFocalPoint">
+        <Element index="0" value="50"/>
+        <Element index="1" value="50"/>
+        <Element index="2" value="25"/>
+      </Property>
+    </Proxy>
+  </ServerManagerState>
+</ParaViewState>'''
+        
+        with open(state_file, 'w') as f:
+            f.write(state_content)
+        
+        print(f"ParaView state file created: {state_file}")
+        print("Load this file in ParaView for automatic setup!")
 
 def main():
     """Main function with command line arguments and movement presets"""

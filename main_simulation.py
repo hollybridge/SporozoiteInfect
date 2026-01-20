@@ -6,7 +6,7 @@ This simulation models the journey of Plasmodium sporozoites from mosquito
 salivary glands through dermal tissue to blood vessels, representing the
 early stages of malaria infection.
 
-Author: GitHub Copilot
+Author: Holly Evans
 Date: January 2026
 """
 
