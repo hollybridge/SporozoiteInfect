@@ -242,8 +242,8 @@ class ImplicitDermalTissue:
         """Calculate immune response intensity at sporozoite location"""
         immune_density = self.immune_interpolator(sporozoite_position)[()]
         
-        # Immune response reduces sporozoite viability
-        damage_rate = immune_density * 0.02  # damage per time step
+        # Immune response reduces sporozoite viability - REDUCED damage rate for better survival
+        damage_rate = immune_density * 0.005  # Reduced from 0.02 to 0.005 (4x less damage)
         
         return damage_rate
     

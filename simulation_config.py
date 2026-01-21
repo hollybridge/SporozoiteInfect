@@ -1,85 +1,106 @@
 """
-Simulation Configuration Parameters
+Simulation Configuration Parameters - SIMPLIFIED APPROACH
 
 This file contains all the key parameters that control sporozoite movement,
-deformation, and simulation dynamics. Adjust these to change behavior.
+deformation, and simulation dynamics. Focus on minimal, effective changes.
 """
 
 class SimulationConfig:
     # Time stepping parameters
-    TIME_STEP = 0.1  # Increased from 0.01 for faster movement
+    TIME_STEP = 0.1
     MAX_TIME = 20.0
     OUTPUT_INTERVAL = 0.5
     
-    # Movement parameters
-    DIRECTIONAL_FORCE_STRENGTH = 15.0  # Increased from 2.0 for more movement
-    MOTILITY_RANGE = (0.6, 1.0)  # Range for random motility
-    MAX_SPEED_RANGE = (5.0, 15.0)  # Increased speed range (micrometers per time step)
+    # Movement parameters - KEEP SIMPLE
+    DIRECTIONAL_FORCE_STRENGTH = 8.0  # Moderate forward movement
+    MOTILITY_RANGE = (0.6, 1.0)
+    MAX_SPEED_RANGE = (3.0, 8.0)
     
-    # Undulation parameters (sporozoite swimming motion)
-    UNDULATION_AMPLITUDE = 2.0  # Reduced from 10.0 to prevent excessive deformation
-    UNDULATION_FREQUENCY_RANGE = (0.8, 1.2)  # Hz
-    UNDULATION_FORCE_SCALE = 3.0  # Reduced from 10.0
+    # Undulation parameters - THE KEY TO FIXING DEFORMATION
+    UNDULATION_AMPLITUDE = 0.3  # MUCH smaller - barely visible undulation
+    UNDULATION_FREQUENCY_RANGE = (0.8, 1.2)
+    UNDULATION_FORCE_SCALE = 0.8  # Very gentle undulation forces
     
-    # Deformation parameters
-    SPRING_CONSTANT_BASE = 20.0  # Reduced from 50.0 for less stiffness
-    STIFFNESS_RANGE = (0.4, 0.8)  # Range for sporozoite stiffness
-    DAMPING_FACTOR = 0.3  # Reduced from 0.8 for less velocity loss
-    MASS = 0.05  # Reduced mass for more responsiveness
+    # Deformation parameters - SIMPLE AND EFFECTIVE
+    SPRING_CONSTANT_BASE = 75.0  # Strong enough to maintain rod shape
+    STIFFNESS_RANGE = (0.8, 0.95)  # High stiffness = less deformation
+    DAMPING_FACTOR = 0.4
+    MASS = 0.1  # Slightly higher mass for stability
     
-    # Tissue interaction parameters
-    TISSUE_RESISTANCE_SCALE = 0.05  # How much tissue resists movement
-    TISSUE_FLOW_SCALE = 0.1  # How much tissue flow affects sporozoites
+    # Tissue interaction parameters - KEEP MINIMAL
+    TISSUE_RESISTANCE_SCALE = 0.03
+    TISSUE_FLOW_SCALE = 0.05
+    
+    # Immune system parameters
+    ENABLE_IMMUNE_RESPONSE = False  # Set to False to disable immune damage
     
     # Direction change parameters
-    RANDOM_DIRECTION_PROBABILITY = 0.05  # Probability per time step
-    MAX_DIRECTION_CHANGE = 0.3  # Maximum radians to change direction
+    RANDOM_DIRECTION_PROBABILITY = 0.02  # Less frequent direction changes
+    MAX_DIRECTION_CHANGE = 0.2
     
     # Boundary conditions
-    BOUNDARY_DAMPING = 0.5  # Velocity reduction at boundaries
+    BOUNDARY_DAMPING = 0.5
     
     # Physical properties
-    SPOROZOITE_LENGTH_RANGE = (10.0, 15.0)  # micrometers
-    SPOROZOITE_DIAMETER_RANGE = (0.8, 1.2)  # micrometers
+    SPOROZOITE_LENGTH_RANGE = (10.0, 15.0)
+    SPOROZOITE_DIAMETER_RANGE = (0.8, 1.2)
     
     # Mesh resolution
-    LONGITUDINAL_SEGMENTS = 15  # Reduced from 20 for performance
-    RADIAL_SEGMENTS = 6  # Reduced from 8 for performance
+    LONGITUDINAL_SEGMENTS = 12  # Fewer segments for stability
+    RADIAL_SEGMENTS = 6
 
 class PresetConfigs:
-    """Predefined configurations for different behaviors"""
+    """Simplified presets focusing on working solutions"""
     
     @staticmethod
-    def fast_movement():
-        """Configuration for fast-moving sporozoites"""
+    def minimal_deformation():
+        """Minimal deformation while allowing movement - RECOMMENDED"""
         config = SimulationConfig()
-        config.TIME_STEP = 0.15
-        config.DIRECTIONAL_FORCE_STRENGTH = 25.0
-        config.MAX_SPEED_RANGE = (10.0, 20.0)
-        config.UNDULATION_AMPLITUDE = 1.5
-        config.DAMPING_FACTOR = 0.2
+        config.TIME_STEP = 0.12
+        config.DIRECTIONAL_FORCE_STRENGTH = 10.0
+        config.UNDULATION_AMPLITUDE = 0.2  # Barely any undulation
+        config.UNDULATION_FORCE_SCALE = 0.5
+        config.SPRING_CONSTANT_BASE = 100.0  # Very stiff
+        config.STIFFNESS_RANGE = (0.85, 0.95)
+        config.DAMPING_FACTOR = 0.3
         return config
     
     @staticmethod
     def realistic_movement():
-        """Configuration for realistic sporozoite movement"""
+        """Balanced realistic movement"""
         config = SimulationConfig()
         config.TIME_STEP = 0.1
-        config.DIRECTIONAL_FORCE_STRENGTH = 12.0
-        config.MAX_SPEED_RANGE = (3.0, 8.0)
-        config.UNDULATION_AMPLITUDE = 1.8
-        config.UNDULATION_FORCE_SCALE = 2.5
+        config.DIRECTIONAL_FORCE_STRENGTH = 8.0
+        config.UNDULATION_AMPLITUDE = 0.3
+        config.UNDULATION_FORCE_SCALE = 0.8
+        config.SPRING_CONSTANT_BASE = 75.0
+        config.STIFFNESS_RANGE = (0.8, 0.9)
         config.DAMPING_FACTOR = 0.4
         return config
     
     @staticmethod
-    def slow_deformable():
-        """Configuration for slow, highly deformable sporozoites"""
+    def fast_movement():
+        """Fast movement with shape control"""
         config = SimulationConfig()
-        config.TIME_STEP = 0.05
-        config.DIRECTIONAL_FORCE_STRENGTH = 8.0
-        config.SPRING_CONSTANT_BASE = 10.0
-        config.STIFFNESS_RANGE = (0.2, 0.5)
-        config.UNDULATION_AMPLITUDE = 3.0
-        config.DAMPING_FACTOR = 0.6
+        config.TIME_STEP = 0.15
+        config.DIRECTIONAL_FORCE_STRENGTH = 15.0
+        config.MAX_SPEED_RANGE = (8.0, 15.0)
+        config.UNDULATION_AMPLITUDE = 0.25
+        config.UNDULATION_FORCE_SCALE = 0.6
+        config.SPRING_CONSTANT_BASE = 90.0
+        config.STIFFNESS_RANGE = (0.85, 0.95)
+        config.DAMPING_FACTOR = 0.25
+        return config
+    
+    @staticmethod
+    def gentle_flexible():
+        """Gentle movement with slight flexibility"""
+        config = SimulationConfig()
+        config.TIME_STEP = 0.08
+        config.DIRECTIONAL_FORCE_STRENGTH = 6.0
+        config.UNDULATION_AMPLITUDE = 0.4
+        config.UNDULATION_FORCE_SCALE = 1.0
+        config.SPRING_CONSTANT_BASE = 60.0
+        config.STIFFNESS_RANGE = (0.75, 0.85)
+        config.DAMPING_FACTOR = 0.5
         return config

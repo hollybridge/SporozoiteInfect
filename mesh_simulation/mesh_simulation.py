@@ -79,7 +79,10 @@ class MeshBasedSporozoiteSimulation:
             self.sporozoites.append(sporozoite)
             
             print(f"  Created sporozoite {i}: {len(sporozoite.vertices)} vertices, "
-                  f"{len(sporozoite.faces)} faces")
+                  f"{len(sporozoite.faces)} faces, ID={sporozoite.id}")
+            
+            # DEBUG: Verify ID assignment
+            print(f"    DEBUG: Sporozoite object ID verification: {sporozoite.id}")
     
     def update_simulation_step(self):
         """Update one simulation time step"""
@@ -87,7 +90,16 @@ class MeshBasedSporozoiteSimulation:
         total_distance = 0.0
         total_motility = 0.0
         
-        for sporozoite in self.sporozoites:
+        print(f"Step t={self.time:.3f}: Processing {len(self.sporozoites)} sporozoites")
+        
+        # DEBUG: Print current sporozoite IDs before processing
+        current_ids = [s.id for s in self.sporozoites]
+        print(f"  Current sporozoite IDs: {current_ids}")
+        
+        for i, sporozoite in enumerate(self.sporozoites):
+            # DEBUG: Verify sporozoite ID hasn't changed
+            print(f"  Processing sporozoite at index {i} with ID {sporozoite.id}")
+            
             if sporozoite.is_viable():
                 # Store previous position for distance calculation
                 prev_position = sporozoite.center_position.copy()
@@ -95,9 +107,10 @@ class MeshBasedSporozoiteSimulation:
                 # Apply tissue forces
                 sporozoite.apply_tissue_forces(self.tissue_field, self.dt)
                 
-                # Apply immune response
-                immune_damage = self.tissue_field.apply_immune_response(sporozoite.center_position)
-                sporozoite.reduce_viability(immune_damage * self.dt)
+                # Apply immune response only if enabled in config
+                if self.config.ENABLE_IMMUNE_RESPONSE:
+                    immune_damage = self.tissue_field.apply_immune_response(sporozoite.center_position)
+                    sporozoite.reduce_viability(immune_damage * self.dt)
                 
                 # Update sporozoite motion and deformation
                 sporozoite.update_motion(self.dt, self.time)
@@ -110,7 +123,15 @@ class MeshBasedSporozoiteSimulation:
                 total_distance += distance_moved
                 total_motility += sporozoite.motility
                 
+                print(f"    Sporozoite ID {sporozoite.id}: moved {float(distance_moved):.4f} units (motility: {float(sporozoite.motility):.3f}, viability: {float(sporozoite.viability):.3f})")
+                
                 active_sporozoites.append(sporozoite)
+            else:
+                print(f"    Sporozoite ID {sporozoite.id} removed (not viable: {sporozoite.viability:.3f})")
+        
+        # DEBUG: Print surviving sporozoite IDs
+        surviving_ids = [s.id for s in active_sporozoites]
+        print(f"  Surviving sporozoite IDs: {surviving_ids}")
         
         # Update sporozoite list
         self.sporozoites = active_sporozoites
@@ -122,40 +143,83 @@ class MeshBasedSporozoiteSimulation:
             self.stats['average_motility'] = total_motility / len(active_sporozoites)
     
     def _apply_boundary_conditions(self, sporozoite):
-        """Apply boundary conditions to keep sporozoites within domain using config damping"""
+        """Apply boundary conditions using rigid body approach - FIXED VERSION WITH DEBUGGING"""
+        # Check if center of mass is near boundaries and apply corrections to center only
+        center = sporozoite.center_position
         damping = self.config.BOUNDARY_DAMPING
         
+        # DEBUG: Check if any vertices are out of bounds BEFORE correction
+        vertices_out_of_bounds = []
         for i, vertex in enumerate(sporozoite.vertices):
+            if (vertex[0] <= 0 or vertex[0] >= self.domain_size[0] or
+                vertex[1] <= 0 or vertex[1] >= self.domain_size[1] or
+                vertex[2] <= 0 or vertex[2] >= self.domain_size[2]):
+                vertices_out_of_bounds.append((i, vertex.copy()))
+        
+        if vertices_out_of_bounds:
+            print(f"BOUNDARY WARNING: Sporozoite {sporozoite.id} has {len(vertices_out_of_bounds)} vertices out of bounds")
+            for i, vertex in vertices_out_of_bounds:
+                print(f"  Vertex {i}: {vertex}")
+        
+        # Calculate how much the center needs to be moved to keep all vertices in bounds
+        center_correction = np.array([0.0, 0.0, 0.0])
+        
+        # Check if any vertices are out of bounds and calculate center correction
+        for vertex in sporozoite.vertices:
             # X boundaries
             if vertex[0] <= 0:
-                sporozoite.vertices[i, 0] = 0.1
-                if sporozoite.velocity[i, 0] < 0:
-                    sporozoite.velocity[i, 0] *= -damping
+                correction_needed = 0.1 - vertex[0]
+                center_correction[0] = max(center_correction[0], correction_needed)
             elif vertex[0] >= self.domain_size[0]:
-                sporozoite.vertices[i, 0] = self.domain_size[0] - 0.1
-                if sporozoite.velocity[i, 0] > 0:
-                    sporozoite.velocity[i, 0] *= -damping
+                correction_needed = self.domain_size[0] - 0.1 - vertex[0]
+                center_correction[0] = min(center_correction[0], correction_needed)
             
             # Y boundaries
             if vertex[1] <= 0:
-                sporozoite.vertices[i, 1] = 0.1
-                if sporozoite.velocity[i, 1] < 0:
-                    sporozoite.velocity[i, 1] *= -damping
+                correction_needed = 0.1 - vertex[1]
+                center_correction[1] = max(center_correction[1], correction_needed)
             elif vertex[1] >= self.domain_size[1]:
-                sporozoite.vertices[i, 1] = self.domain_size[1] - 0.1
-                if sporozoite.velocity[i, 1] > 0:
-                    sporozoite.velocity[i, 1] *= -damping
+                correction_needed = self.domain_size[1] - 0.1 - vertex[1]
+                center_correction[1] = min(center_correction[1], correction_needed)
             
             # Z boundaries
             if vertex[2] <= 0:
-                sporozoite.vertices[i, 2] = 0.1
-                if sporozoite.velocity[i, 2] < 0:
-                    sporozoite.velocity[i, 2] *= -damping
+                correction_needed = 0.1 - vertex[2]
+                center_correction[2] = max(center_correction[2], correction_needed)
             elif vertex[2] >= self.domain_size[2]:
-                sporozoite.vertices[i, 2] = self.domain_size[2] - 0.1
-                if sporozoite.velocity[i, 2] > 0:
-                    sporozoite.velocity[i, 2] *= -damping
-
+                correction_needed = self.domain_size[2] - 0.1 - vertex[2]
+                center_correction[2] = min(center_correction[2], correction_needed)
+        
+        # Apply center correction if needed (rigid body translation)
+        if np.linalg.norm(center_correction) > 1e-8:
+            print(f"BOUNDARY CORRECTION: Sporozoite {sporozoite.id} center moved by {center_correction}")
+            print(f"  Center before: {sporozoite.center_position}")
+            
+            sporozoite.center_position += center_correction
+            
+            # Update all vertices rigidly with the center correction
+            for i in range(len(sporozoite.vertices)):
+                sporozoite.vertices[i] += center_correction
+            
+            print(f"  Center after: {sporozoite.center_position}")
+            
+            # Apply damping to all vertex velocities uniformly (rigid body)
+            for i in range(len(sporozoite.velocity)):
+                sporozoite.velocity[i] *= damping
+            
+            print(f"  Applied damping factor: {damping}")
+        
+        # DEBUG: Final check if correction worked
+        vertices_still_out = 0
+        for vertex in sporozoite.vertices:
+            if (vertex[0] <= 0 or vertex[0] >= self.domain_size[0] or
+                vertex[1] <= 0 or vertex[1] >= self.domain_size[1] or
+                vertex[2] <= 0 or vertex[2] >= self.domain_size[2]):
+                vertices_still_out += 1
+        
+        if vertices_still_out > 0:
+            print(f"BOUNDARY ERROR: {vertices_still_out} vertices still out of bounds after correction!")
+    
     def _write_presets_config_file(self):
         """Write comprehensive presets configuration file with all available options"""
         presets_file = os.path.join(self.output_dir, "simulation_presets.cfg")
@@ -227,19 +291,7 @@ class MeshBasedSporozoiteSimulation:
             f.write(f"REALISTIC_DAMPING_FACTOR = {realistic_config.DAMPING_FACTOR}\n")
             f.write(f"REALISTIC_SPRING_CONSTANT_BASE = {realistic_config.SPRING_CONSTANT_BASE}\n")
             f.write("\n")
-            
-            # Slow deformable preset
-            slow_config = PresetConfigs.slow_deformable()
-            f.write("# SLOW DEFORMABLE PRESET\n")
-            f.write("# Command: --movement-preset slow-deformable\n")
-            f.write("# Description: Highly flexible sporozoites, slow but deformable\n")
-            f.write(f"SLOW_TIME_STEP = {slow_config.TIME_STEP}\n")
-            f.write(f"SLOW_DIRECTIONAL_FORCE_STRENGTH = {slow_config.DIRECTIONAL_FORCE_STRENGTH}\n")
-            f.write(f"SLOW_SPRING_CONSTANT_BASE = {slow_config.SPRING_CONSTANT_BASE}\n")
-            f.write(f"SLOW_STIFFNESS_RANGE = {slow_config.STIFFNESS_RANGE}\n")
-            f.write(f"SLOW_UNDULATION_AMPLITUDE = {slow_config.UNDULATION_AMPLITUDE}\n")
-            f.write(f"SLOW_DAMPING_FACTOR = {slow_config.DAMPING_FACTOR}\n")
-            f.write("\n")
+
             
             # Command examples
             f.write("="*60 + "\n")
@@ -377,25 +429,33 @@ class MeshBasedSporozoiteSimulation:
     def _write_sporozoite_vtk(self, step_number: int):
         """Write sporozoite mesh data to VTK"""
         if not self.sporozoites:
+            print(f"VTK WRITE DEBUG: No sporozoites to write at step {step_number}")
             return
+        
+        print(f"VTK WRITE DEBUG: Writing {len(self.sporozoites)} sporozoites at step {step_number}")
         
         # Create multi-block dataset for all sporozoites
         multiblock = vtk.vtkMultiBlockDataSet()
         multiblock.SetNumberOfBlocks(len(self.sporozoites))
         
         for i, sporozoite in enumerate(self.sporozoites):
+            print(f"  VTK WRITE DEBUG: Block {i} = Sporozoite ID {sporozoite.id}")
             polydata = sporozoite.to_vtk_polydata()
             multiblock.SetBlock(i, polydata)
             multiblock.GetMetaData(i).Set(vtk.vtkCompositeDataSet.NAME(), f"Sporozoite_{sporozoite.id}")
         
         # Write to file with proper format settings
         filename = os.path.join(self.output_dir, f"sporozoites_{step_number:04d}.vtm")
+        print(f"VTK WRITE DEBUG: Writing to file: {filename}")
+        
         writer = vtk.vtkXMLMultiBlockDataWriter()
         writer.SetFileName(filename)
         writer.SetInputData(multiblock)
         writer.SetDataModeToAscii()  # Use ASCII format for better compatibility
         writer.SetCompressorTypeToNone()  # Disable compression to avoid binary issues
         writer.Write()
+        
+        print(f"VTK WRITE DEBUG: File written successfully")
     
     def _write_tissue_field_vtk(self, step_number: int):
         """Write tissue field data to VTK"""
@@ -627,9 +687,9 @@ def main():
                        help='VTK output interval (default: 0.5)')
     
     # Add movement preset options
-    parser.add_argument('--movement-preset', choices=['default', 'fast', 'realistic', 'slow-deformable'],
-                       default='realistic',
-                       help='Movement behavior preset (default: realistic)')
+    parser.add_argument('--movement-preset', choices=['default', 'minimal-deformation', 'realistic', 'fast', 'gentle-flexible'],
+                       default='minimal-deformation',
+                       help='Movement behavior preset (default: minimal-deformation)')
     
     # Add individual parameter overrides
     parser.add_argument('--time-step', type=float, 
@@ -644,15 +704,18 @@ def main():
     args = parser.parse_args()
     
     # Select configuration based on preset
-    if args.movement_preset == 'fast':
-        config = PresetConfigs.fast_movement()
-        print("Using FAST MOVEMENT preset - sporozoites will move quickly")
+    if args.movement_preset == 'minimal-deformation':
+        config = PresetConfigs.minimal_deformation()
+        print("Using MINIMAL DEFORMATION preset - RECOMMENDED for shape preservation")
     elif args.movement_preset == 'realistic':
         config = PresetConfigs.realistic_movement()
-        print("Using REALISTIC MOVEMENT preset - balanced speed and deformation")
-    elif args.movement_preset == 'slow-deformable':
-        config = PresetConfigs.slow_deformable()
-        print("Using SLOW DEFORMABLE preset - highly deformable, slow movement")
+        print("Using REALISTIC MOVEMENT preset - balanced movement")
+    elif args.movement_preset == 'fast':
+        config = PresetConfigs.fast_movement()
+        print("Using FAST MOVEMENT preset - quick movement with shape control")
+    elif args.movement_preset == 'gentle-flexible':
+        config = PresetConfigs.gentle_flexible()
+        print("Using GENTLE FLEXIBLE preset - slight flexibility allowed")
     else:
         config = SimulationConfig()
         print("Using DEFAULT configuration")

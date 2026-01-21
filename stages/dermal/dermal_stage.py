@@ -96,8 +96,9 @@ class DermalTissue:
                 # Update position with tissue resistance
                 sporozoite.update_position(time_step, tissue_resistance)
                 
-                # Simulate immune response
-                self.simulate_immune_response(sporozoite)
+                # Simulate immune response only if enabled in config
+                if hasattr(self, 'config') and self.config.ENABLE_IMMUNE_RESPONSE:
+                    self.simulate_immune_response(sporozoite)
                 
                 # Random direction changes due to tissue obstacles
                 if random.random() < 0.1:
@@ -115,9 +116,16 @@ class DermalTissue:
 class DermalStageSimulation:
     """Main simulation class for the dermal stage"""
     
-    def __init__(self, num_sporozoites: int = 30):
+    def __init__(self, num_sporozoites: int = 30, config=None):
+        # Import here to avoid circular imports
+        from simulation_config import SimulationConfig
+        
+        self.config = config or SimulationConfig()
         self.salivary_gland = SalivaryGland((50, 50))
         self.dermal_tissue = DermalTissue(200, 200)
+        
+        # Pass config to dermal tissue
+        self.dermal_tissue.config = self.config
         
         # Create initial sporozoites in salivary gland
         for i in range(num_sporozoites):
