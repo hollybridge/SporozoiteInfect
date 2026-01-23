@@ -23,6 +23,7 @@ sys.path.append(os.path.dirname(__file__))
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from sporozoite_mesh import DeformableSporozoiteMesh
 from dermal_field import ImplicitDermalTissue
+from blood_flow_field import ImplicitBloodFlowField, FlowType
 from simulation_config import SimulationConfig, PresetConfigs
 
 class MeshBasedSporozoiteSimulation:
@@ -31,14 +32,37 @@ class MeshBasedSporozoiteSimulation:
     """
     
     def __init__(self, num_sporozoites: int = 5, domain_size: tuple = (100.0, 100.0, 50.0), 
-                 config=None):
+                 config=None, use_blood_flow: bool = False, flow_type: str = "laminar",
+                 inlet_velocity: float = 50.0, vessel_diameter: float = 20.0):
         self.num_sporozoites = num_sporozoites
         self.domain_size = domain_size
         self.config = config or SimulationConfig()
+        self.use_blood_flow = use_blood_flow
         
-        # Initialize dermal tissue field
-        print("Generating implicit dermal tissue field...")
-        self.tissue_field = ImplicitDermalTissue(domain_size)
+        # Initialize environment field (either dermal tissue or blood flow)
+        if use_blood_flow:
+            print(f"Generating implicit blood flow field ({flow_type})...")
+            flow_type_enum = FlowType(flow_type.lower())
+            
+            if flow_type_enum == FlowType.SIMPLE_SHEAR:
+                self.environment_field = ImplicitBloodFlowField.create_simple_shear(
+                    domain_size, shear_rate=inlet_velocity, vessel_diameter=vessel_diameter)
+            elif flow_type_enum == FlowType.LAMINAR:
+                self.environment_field = ImplicitBloodFlowField.create_laminar_flow(
+                    domain_size, inlet_velocity=inlet_velocity, vessel_diameter=vessel_diameter)
+            elif flow_type_enum == FlowType.TURBULENT:
+                self.environment_field = ImplicitBloodFlowField.create_turbulent_flow(
+                    domain_size, inlet_velocity=inlet_velocity, reynolds_number=2500.0)
+            else:
+                self.environment_field = ImplicitBloodFlowField(
+                    domain_size, flow_type=flow_type_enum, inlet_velocity=inlet_velocity,
+                    vessel_diameter=vessel_diameter)
+        else:
+            print("Generating implicit dermal tissue field...")
+            self.environment_field = ImplicitDermalTissue(domain_size)
+        
+        # Keep reference for compatibility (some methods expect tissue_field)
+        self.tissue_field = self.environment_field
         
         # Initialize sporozoites
         print(f"Creating {num_sporozoites} mesh-based sporozoites...")
@@ -53,14 +77,17 @@ class MeshBasedSporozoiteSimulation:
         self.last_output_time = 0.0
         
         # Output setup
-        self.output_dir = f"vtk_output/simulation_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        env_type = "bloodflow" if use_blood_flow else "tissue"
+        self.output_dir = f"vtk_output/simulation_{env_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         os.makedirs(self.output_dir, exist_ok=True)
         
         # Statistics
         self.stats = {
             'active_sporozoites': num_sporozoites,
             'total_distance_traveled': 0.0,
-            'average_motility': 0.0
+            'average_motility': 0.0,
+            'environment_type': env_type,
+            'flow_type': flow_type if use_blood_flow else 'N/A'
         }
     
     def _create_sporozoites(self):
@@ -632,75 +659,6 @@ class MeshBasedSporozoiteSimulation:
                        f"viability={viability:.3f}, "
                        f"motility={motility:.3f}\n")
     
-    def _write_paraview_instructions(self):
-        """Write comprehensive instructions for loading data in ParaView with animation"""
-        instructions_file = os.path.join(self.output_dir, "ParaView_Instructions.txt")
-        
-        with open(instructions_file, 'w') as f:
-            f.write("ParaView Animation Instructions - UPDATED FOR TIME SERIES\n")
-            f.write("=========================================================\n\n")            
-            f.write(" ANIMATION SETUP (MOST IMPORTANT):\n")
-            f.write("====================================\n")
-            f.write("1. Open ParaView\n")
-            f.write("2. Load sporozoite data:\n")
-            f.write("   - File > Open > Browse to this simulation folder\n")
-            f.write("   - Select ALL sporozoites_*.vtm files (Ctrl+A or Cmd+A)\n")
-            f.write("   - Click 'OK'\n")
-            f.write("   - In Properties panel, click 'Apply'\n\n")
-            f.write("3.  ENABLE TIME SERIES ANIMATION:\n")
-            f.write("   - Look at the bottom toolbar for time controls\n")
-            f.write("   - You should see time range (0.0 to max simulation time)\n")
-            f.write("   - Click the PLAY button ▶ to animate\n")
-            f.write("   - Use the time slider to scrub through time\n\n")
-            f.write("4. If animation doesn't work:\n")
-            f.write("   - Check that you selected ALL vtm files, not just one\n")
-            f.write("   - Look for 'TimeValue' in Information tab\n")
-            f.write("   - Try: View > Animation View to see timeline\n\n")
-            f.write("🔧 VISUALIZATION SETUP:\n")
-            f.write("=======================\n")
-            f.write("1. Color sporozoites:\n")
-            f.write("   - In Properties panel, find 'Coloring'\n")
-            f.write("   - Change from 'Solid Color' to 'Viability' or 'SporozoiteID'\n")
-            f.write("   - Click 'Apply'\n\n")
-            f.write("2. Load tissue field (optional):\n")
-            f.write("   - File > Open > tissue_field_*.vts (select all)\n")
-            f.write("   - Click 'Apply'\n")
-            f.write("   - Change representation to 'Volume' or 'Outline'\n\n")
-            f.write("3. Advanced visualization:\n")
-            f.write("   - Use 'Glyph' filter on flow field vectors\n")
-            f.write("   - Add 'Streamlines' to show flow patterns\n")
-            f.write("   - Use 'Clip' filter to see internal structure\n\n")
-            f.write(" AVAILABLE DATA FIELDS:\n")
-            f.write("=========================\n")
-            f.write("Sporozoites:\n")
-            f.write("- Viability: Health of sporozoite (0-1)\n")
-            f.write("- VelocityMagnitude: Speed of movement\n")
-            f.write("- Motility: Movement capability (0-1)\n")
-            f.write("- SporozoiteID: Unique identifier for tracking\n")
-            f.write("- TimeValue: Current simulation time\n\n")
-            f.write("Tissue:\n")
-            f.write("- CollagenDensity: Structural protein density\n")
-            f.write("- ImmuneCellDensity: Immune response strength\n")
-            f.write("- Pressure: Tissue pressure field\n")
-            f.write("- FlowField: Tissue fluid flow (vector)\n\n")
-            f.write(" TROUBLESHOOTING:\n")
-            f.write("==================\n")
-            f.write("Problem: 'Time=1' and no animation\n")
-            f.write("Solution: Make sure you loaded ALL .vtm files as a series\n\n")
-            f.write("Problem: Files don't load\n")
-            f.write("Solution: Check file paths, use File > Open to browse\n\n")
-            f.write("Problem: Animation too fast/slow\n")
-            f.write("Solution: View > Animation View > adjust time settings\n\n")
-            f.write("Problem: Can't see sporozoites\n")
-            f.write("Solution: Zoom out, check visibility eye icon, adjust opacity\n\n")
-            f.write(f" Simulation Details:\n")
-            f.write(f"=====================\n")
-            f.write(f"Total time steps: Expected multiple files\n")
-            f.write(f"Time range: 0.0 to {self.max_time:.2f}\n")
-            f.write(f"Output interval: {self.config.OUTPUT_INTERVAL}\n")
-            f.write(f"Domain size: {self.domain_size}\n")
-            f.write(f"Spring constant: {self.config.SPRING_CONSTANT_BASE}\n")
-            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     
     def _write_paraview_state_file(self):
         """Write ParaView state file for automatic setup"""
@@ -907,7 +865,6 @@ class MeshBasedSporozoiteSimulation:
         print(f"Total VTK outputs: {output_count + 1}")
         
         # Write ParaView state file
-        self._write_paraview_instructions()
         self._write_paraview_state_file()
         
 
@@ -923,6 +880,17 @@ def main():
                        help='Domain size [x y z] in micrometers (default: 100 100 50)')
     parser.add_argument('--output-interval', type=float, default=0.5,
                        help='VTK output interval (default: 0.5)')
+    
+    # Add blood flow simulation options
+    parser.add_argument('--use-blood-flow', action='store_true',
+                       help='Use blood flow field instead of dermal tissue field')
+    parser.add_argument('--flow-type', choices=['simple_shear', 'laminar', 'turbulent'],
+                       default='laminar',
+                       help='Type of blood flow (default: laminar)')
+    parser.add_argument('--inlet-velocity', type=float, default=50.0,
+                       help='Inlet velocity in μm/s (default: 50.0)')
+    parser.add_argument('--vessel-diameter', type=float, default=20.0,
+                       help='Blood vessel diameter in μm (default: 20.0)')
     
     # Add movement preset options
     parser.add_argument('--movement-preset', choices=['default', 'minimal-deformation', 'realistic', 'fast', 'gentle-flexible'],
@@ -994,6 +962,14 @@ def main():
     print(f"  Damping factor: {config.DAMPING_FACTOR}")
     print(f"  Max speed range: {config.MAX_SPEED_RANGE}")
     
+    # Print blood flow configuration if enabled
+    if args.use_blood_flow:
+        print(f"\nBlood Flow Configuration:")
+        print(f"  Flow type: {args.flow_type}")
+        print(f"  Inlet velocity: {args.inlet_velocity} μm/s")
+        print(f"  Vessel diameter: {args.vessel_diameter} μm")
+        print(f"  Reynolds number: ~{(args.inlet_velocity * args.vessel_diameter / 1000):.0f} (estimated)")
+    
     # Validate arguments
     if args.sporozoites > 10:
         print("Warning: More than 10 sporozoites may be computationally expensive")
@@ -1005,7 +981,11 @@ def main():
     simulation = MeshBasedSporozoiteSimulation(
         num_sporozoites=args.sporozoites,
         domain_size=tuple(args.domain_size),
-        config=config
+        config=config,
+        use_blood_flow=args.use_blood_flow,
+        flow_type=args.flow_type,
+        inlet_velocity=args.inlet_velocity,
+        vessel_diameter=args.vessel_diameter
     )
     
     simulation.run_simulation()
@@ -1020,9 +1000,15 @@ def main():
     print("• Too stiff: try --damping 0.2")
     print("• Moving too fast: try --movement-preset slow-deformable or --time-step 0.05")
     print("\nExample commands:")
+    print("DERMAL TISSUE SIMULATION:")
     print("  python mesh_simulation.py --movement-preset fast --sporozoites 3")
     print("  python mesh_simulation.py --directional-force 20 --undulation-amplitude 1.5")
     print("  python mesh_simulation.py --movement-preset realistic --time 10")
+    print("\nBLOOD FLOW SIMULATION:")
+    print("  python mesh_simulation.py --use-blood-flow --flow-type laminar --sporozoites 3")
+    print("  python mesh_simulation.py --use-blood-flow --flow-type turbulent --inlet-velocity 100")
+    print("  python mesh_simulation.py --use-blood-flow --flow-type simple_shear --vessel-diameter 30")
+    print("  python mesh_simulation.py --use-blood-flow --flow-type laminar --movement-preset fast")
 
 if __name__ == "__main__":
     main()
