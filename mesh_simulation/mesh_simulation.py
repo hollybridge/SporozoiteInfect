@@ -64,25 +64,92 @@ class MeshBasedSporozoiteSimulation:
         }
     
     def _create_sporozoites(self):
-        """Create initial sporozoite meshes at injection site"""
-        # Injection occurs in a small volume (salivary gland area)
-        injection_center = np.array([0.0, 0.0, 20.0])  # near top of domain
-        injection_radius = 5.0
+        """Create initial sporozoite meshes at injection site with proper boundary checking"""
+        # Calculate safe injection area accounting for sporozoite size
+        max_length = self.config.SPOROZOITE_LENGTH_RANGE[1]  # Maximum possible sporozoite length
+        max_diameter = self.config.SPOROZOITE_DIAMETER_RANGE[1]  # Maximum possible diameter
+        
+        # Safe margins from domain boundaries (account for half the sporozoite extending in each direction)
+        safety_margin = max(max_length, max_diameter) / 2 + 1.0  # Extra 1.0 for safety
+        
+        # Calculate safe injection volume within domain bounds
+        safe_min = np.array([safety_margin, safety_margin, safety_margin])
+        safe_max = np.array([
+            self.domain_size[0] - safety_margin,
+            self.domain_size[1] - safety_margin, 
+            self.domain_size[2] - safety_margin
+        ])
+        
+        # Ensure we have a valid injection area
+        if np.any(safe_min >= safe_max):
+            print("WARNING: Domain too small for safe sporozoite initialization!")
+            print(f"Domain size: {self.domain_size}")
+            print(f"Required safety margin: {safety_margin}")
+            # Fall back to center of domain
+            injection_center = np.array([d/2 for d in self.domain_size])
+            injection_radius = min(self.domain_size) / 4  # Conservative radius
+        else:
+            # Use safe area near top of domain (salivary gland area)
+            injection_center = np.array([
+                (safe_min[0] + safe_max[0]) / 2,  # Center X
+                (safe_min[1] + safe_max[1]) / 2,  # Center Y  
+                safe_max[2] - safety_margin / 2   # Near top Z
+            ])
+            injection_radius = min(
+                (safe_max[0] - safe_min[0]) / 4,  # Quarter of safe X range
+                (safe_max[1] - safe_min[1]) / 4,  # Quarter of safe Y range
+                safety_margin / 2                 # Half the safety margin in Z
+            )
+        
+        print(f"Safe injection center: {injection_center}")
+        print(f"Safe injection radius: {injection_radius}")
+        print(f"Safety margin: {safety_margin}")
         
         for i in range(self.num_sporozoites):
-            # Random position within injection volume
-            offset = np.random.uniform(-injection_radius, injection_radius, 3)
-            initial_pos = injection_center + offset
+            # Generate safe random position within injection volume
+            max_attempts = 50  # Prevent infinite loops
+            attempts = 0
+            
+            while attempts < max_attempts:
+                # Random position within injection volume
+                offset = np.random.uniform(-injection_radius, injection_radius, 3)
+                initial_pos = injection_center + offset
+                
+                # Verify position is safe (well within domain bounds)
+                if (np.all(initial_pos >= safe_min) and np.all(initial_pos <= safe_max)):
+                    break
+                    
+                attempts += 1
+            
+            if attempts >= max_attempts:
+                print(f"WARNING: Could not find safe position for sporozoite {i}, using center")
+                initial_pos = injection_center.copy()
             
             # Create sporozoite mesh with config
             sporozoite = DeformableSporozoiteMesh(i, initial_pos, self.config)
             self.sporozoites.append(sporozoite)
             
+            # Verify the created sporozoite is actually within bounds
+            vertex_positions = np.array(sporozoite.vertices)
+            min_coords = np.min(vertex_positions, axis=0)
+            max_coords = np.max(vertex_positions, axis=0)
+            
+            # Check if any vertices are out of bounds
+            out_of_bounds = (
+                np.any(min_coords <= 0) or 
+                np.any(max_coords >= np.array(self.domain_size))
+            )
+            
             print(f"  Created sporozoite {i}: {len(sporozoite.vertices)} vertices, "
                   f"{len(sporozoite.faces)} faces, ID={sporozoite.id}")
+            print(f"    Center: {initial_pos}")
+            print(f"    Bounds: [{min_coords[0]:.2f}, {min_coords[1]:.2f}, {min_coords[2]:.2f}] to "
+                  f"[{max_coords[0]:.2f}, {max_coords[1]:.2f}, {max_coords[2]:.2f}]")
             
-            # DEBUG: Verify ID assignment
-            print(f"    DEBUG: Sporozoite object ID verification: {sporozoite.id}")
+            if out_of_bounds:
+                print(f"      WARNING: Sporozoite {i} vertices extend outside domain bounds!")
+            else:
+                print(f"\n")
     
     def update_simulation_step(self):
         """Update one simulation time step"""
@@ -94,11 +161,11 @@ class MeshBasedSporozoiteSimulation:
         
         # DEBUG: Print current sporozoite IDs before processing
         current_ids = [s.id for s in self.sporozoites]
-        print(f"  Current sporozoite IDs: {current_ids}")
+        #print(f"  Current sporozoite IDs: {current_ids}")
         
         for i, sporozoite in enumerate(self.sporozoites):
             # DEBUG: Verify sporozoite ID hasn't changed
-            print(f"  Processing sporozoite at index {i} with ID {sporozoite.id}")
+            #print(f"  Processing sporozoite at index {i} with ID {sporozoite.id}")
             
             if sporozoite.is_viable():
                 # Store previous position for distance calculation
@@ -112,8 +179,62 @@ class MeshBasedSporozoiteSimulation:
                     immune_damage = self.tissue_field.apply_immune_response(sporozoite.center_position)
                     sporozoite.reduce_viability(immune_damage * self.dt)
                 
-                # Update sporozoite motion and deformation
-                sporozoite.update_motion(self.dt, self.time)
+                # Calculate forces for this sporozoite
+                forces = {}
+                
+                # Directional movement force
+                direction_vec = np.array([np.cos(sporozoite.direction), np.sin(sporozoite.direction), 0])
+                forces['directional'] = direction_vec * self.config.DIRECTIONAL_FORCE_STRENGTH
+                
+                # Random movement
+                if np.random.random() < self.config.RANDOM_DIRECTION_PROBABILITY:
+                    random_force = np.random.uniform(-1, 1, 3) * 2.0
+                    forces['random'] = random_force
+                else:
+                    forces['random'] = np.zeros(3)
+                
+                # Boundary repulsion
+                forces['boundary_repulsion'] = np.zeros(3)
+                
+                # Undulation forces (apply to each vertex)
+                undulation_forces = []
+                phase = sporozoite.undulation_phase + self.time * sporozoite.undulation_frequency * 2 * np.pi
+                
+                for i, vertex in enumerate(sporozoite.vertices):
+                    relative_pos = vertex - sporozoite.center_position
+                    body_position = np.dot(relative_pos, direction_vec)
+                    normalized_position = body_position / (sporozoite.length/2) if sporozoite.length > 0 else 0
+                    
+                    # Perpendicular undulation - CONTROLLED FOR STABLE DEFORMATION
+                    perpendicular = np.array([-np.sin(sporozoite.direction), np.cos(sporozoite.direction), 0])
+                    vertical = np.array([0, 0, 1])
+                    
+                    # Controlled wave amplitude for visible but stable deformation
+                    wave_amplitude = self.config.UNDULATION_AMPLITUDE * sporozoite.motility
+                    
+                    # Enhance forces for low spring constants but keep them reasonable
+                    if self.config.SPRING_CONSTANT_BASE < 20.0:
+                        wave_amplitude *= 1.5  # Moderate enhancement for flexible meshes
+                    
+                    # Create controlled undulation pattern
+                    lateral_phase = phase + normalized_position * 2 * np.pi  # Fewer waves for stability
+                    vertical_phase = phase + normalized_position * np.pi
+                    
+                    lateral_force = perpendicular * wave_amplitude * np.sin(lateral_phase)
+                    vertical_force = vertical * wave_amplitude * np.cos(vertical_phase) * 0.3
+                    
+                    # Add minimal random variation for natural movement
+                    random_component = np.random.normal(0, wave_amplitude * 0.05, 3)
+                    
+                    undulation_force = (lateral_force + vertical_force + random_component) * self.config.UNDULATION_FORCE_SCALE
+                    undulation_forces.append(undulation_force)
+                
+                forces['undulation'] = undulation_forces
+                
+                # Update sporozoite motion and deformation with forces and spring constant
+                sporozoite.update_motion(self.dt, forces, 
+                                       spring_constant=self.config.SPRING_CONSTANT_BASE,
+                                       damping=self.config.DAMPING_FACTOR)
                 
                 # Keep sporozoites within domain bounds
                 self._apply_boundary_conditions(sporozoite)
@@ -123,7 +244,7 @@ class MeshBasedSporozoiteSimulation:
                 total_distance += distance_moved
                 total_motility += sporozoite.motility
                 
-                print(f"    Sporozoite ID {sporozoite.id}: moved {float(distance_moved):.4f} units (motility: {float(sporozoite.motility):.3f}, viability: {float(sporozoite.viability):.3f})")
+                #print(f"    Sporozoite ID {sporozoite.id}: moved {float(distance_moved):.4f} units (motility: {float(sporozoite.motility):.3f}, viability: {float(sporozoite.viability):.3f})")
                 
                 active_sporozoites.append(sporozoite)
             else:
@@ -149,6 +270,7 @@ class MeshBasedSporozoiteSimulation:
         damping = self.config.BOUNDARY_DAMPING
         
         # DEBUG: Check if any vertices are out of bounds BEFORE correction
+        
         vertices_out_of_bounds = []
         for i, vertex in enumerate(sporozoite.vertices):
             if (vertex[0] <= 0 or vertex[0] >= self.domain_size[0] or
@@ -157,9 +279,10 @@ class MeshBasedSporozoiteSimulation:
                 vertices_out_of_bounds.append((i, vertex.copy()))
         
         if vertices_out_of_bounds:
-            print(f"BOUNDARY WARNING: Sporozoite {sporozoite.id} has {len(vertices_out_of_bounds)} vertices out of bounds")
+            #print(f"BOUNDARY WARNING: Sporozoite {sporozoite.id} has {len(vertices_out_of_bounds)} vertices out of bounds")
             for i, vertex in vertices_out_of_bounds:
-                print(f"  Vertex {i}: {vertex}")
+                #print(f"  Vertex {i}: {vertex}")
+                pass
         
         # Calculate how much the center needs to be moved to keep all vertices in bounds
         center_correction = np.array([0.0, 0.0, 0.0])
@@ -192,8 +315,8 @@ class MeshBasedSporozoiteSimulation:
         
         # Apply center correction if needed (rigid body translation)
         if np.linalg.norm(center_correction) > 1e-8:
-            print(f"BOUNDARY CORRECTION: Sporozoite {sporozoite.id} center moved by {center_correction}")
-            print(f"  Center before: {sporozoite.center_position}")
+            #print(f"BOUNDARY CORRECTION: Sporozoite {sporozoite.id} center moved by {center_correction}")
+            #print(f"  Center before: {sporozoite.center_position}")
             
             sporozoite.center_position += center_correction
             
@@ -201,13 +324,13 @@ class MeshBasedSporozoiteSimulation:
             for i in range(len(sporozoite.vertices)):
                 sporozoite.vertices[i] += center_correction
             
-            print(f"  Center after: {sporozoite.center_position}")
+            #print(f"  Center after: {sporozoite.center_position}")
             
             # Apply damping to all vertex velocities uniformly (rigid body)
             for i in range(len(sporozoite.velocity)):
                 sporozoite.velocity[i] *= damping
             
-            print(f"  Applied damping factor: {damping}")
+            #print(f"  Applied damping factor: {damping}")
         
         # DEBUG: Final check if correction worked
         vertices_still_out = 0
@@ -349,104 +472,38 @@ class MeshBasedSporozoiteSimulation:
             f.write(f"Domain size: {self.domain_size}\n")
             f.write(f"Output directory: {self.output_dir}\n")
     
-    def write_vtk_output(self, step_number: int):
-        """Write VTK files for current simulation state"""
-        # Write sporozoite meshes
-        self._write_sporozoite_vtk(step_number)
-        
-        # Write tissue field data
-        self._write_tissue_field_vtk(step_number)
-        
-        # Write simulation state info
-        self._write_simulation_state(step_number)
-        
-        # Write presets configuration file (only once at the beginning)
-        if step_number == 0:
-            self._write_presets_config_file()
-
-    def run_simulation(self):
-        """Run the complete mesh-based simulation"""
-        print("\nStarting mesh-based sporozoite simulation...")
-        print(f"Domain size: {self.domain_size}")
-        print(f"Time step: {self.dt}")
-        print(f"Max time: {self.max_time}")
-        print(f"Output directory: {self.output_dir}")
-        print("-" * 60)
-        
-        step_count = 0
-        output_count = 0
-        
-        # Initial output
-        print(f"Writing initial state...")
-        self.write_vtk_output(output_count)
-        output_count += 1
-        self.last_output_time = self.time
-        
-        start_time = time.time()
-        
-        while self.time < self.max_time and len(self.sporozoites) > 0:
-            # Update simulation
-            self.update_simulation_step()
-            self.time += self.dt
-            step_count += 1
-            
-            # Output VTK files at intervals
-            if self.time - self.last_output_time >= self.output_interval:
-                self.write_vtk_output(output_count)
-                output_count += 1
-                self.last_output_time = self.time
-                
-                # Progress report
-                elapsed = time.time() - start_time
-                print(f"Time: {self.time:6.2f} | "
-                      f"Active: {len(self.sporozoites):2d} | "
-                      f"Avg motility: {self.stats['average_motility']:.3f} | "
-                      f"Elapsed: {elapsed:.1f}s")
-            
-            # Safety check for very long simulations
-            if step_count > 100000:
-                print("Maximum step count reached, ending simulation")
-                break
-        
-        # Final output
-        if output_count == 0 or self.time - self.last_output_time > 0.1:
-            print("Writing final state...")
-            self.write_vtk_output(output_count)
-        
-        total_time = time.time() - start_time
-        
-        print(f"\nSimulation completed!")
-        print(f"Total simulation time: {self.time:.2f}")
-        print(f"Total computation time: {total_time:.1f}s")
-        print(f"Final active sporozoites: {len(self.sporozoites)}")
-        print(f"VTK files written to: {self.output_dir}")
-        print(f"Total VTK outputs: {output_count + 1}")
-        
-        # Write ParaView state file
-        self._write_paraview_instructions()
-        self._write_paraview_state_file()
-    
     def _write_sporozoite_vtk(self, step_number: int):
-        """Write sporozoite mesh data to VTK"""
+        """Write sporozoite mesh data to VTK with proper time information for animation"""
         if not self.sporozoites:
             print(f"VTK WRITE DEBUG: No sporozoites to write at step {step_number}")
             return
-        
-        print(f"VTK WRITE DEBUG: Writing {len(self.sporozoites)} sporozoites at step {step_number}")
         
         # Create multi-block dataset for all sporozoites
         multiblock = vtk.vtkMultiBlockDataSet()
         multiblock.SetNumberOfBlocks(len(self.sporozoites))
         
+        # Add time information to the dataset
+        time_array = vtk.vtkDoubleArray()
+        time_array.SetName("TimeValue")
+        time_array.SetNumberOfTuples(1)
+        time_array.SetValue(0, self.time)
+        multiblock.GetFieldData().AddArray(time_array)
+        
         for i, sporozoite in enumerate(self.sporozoites):
-            print(f"  VTK WRITE DEBUG: Block {i} = Sporozoite ID {sporozoite.id}")
             polydata = sporozoite.to_vtk_polydata()
+            
+            # Add time information to each block as well
+            time_array_block = vtk.vtkDoubleArray()
+            time_array_block.SetName("TimeValue")
+            time_array_block.SetNumberOfTuples(1)
+            time_array_block.SetValue(0, self.time)
+            polydata.GetFieldData().AddArray(time_array_block)
+            
             multiblock.SetBlock(i, polydata)
             multiblock.GetMetaData(i).Set(vtk.vtkCompositeDataSet.NAME(), f"Sporozoite_{sporozoite.id}")
         
         # Write to file with proper format settings
         filename = os.path.join(self.output_dir, f"sporozoites_{step_number:04d}.vtm")
-        print(f"VTK WRITE DEBUG: Writing to file: {filename}")
         
         writer = vtk.vtkXMLMultiBlockDataWriter()
         writer.SetFileName(filename)
@@ -455,16 +512,24 @@ class MeshBasedSporozoiteSimulation:
         writer.SetCompressorTypeToNone()  # Disable compression to avoid binary issues
         writer.Write()
         
-        print(f"VTK WRITE DEBUG: File written successfully")
+        # Update the time series collection file
+        self._update_time_series_collection(step_number)
     
     def _write_tissue_field_vtk(self, step_number: int):
-        """Write tissue field data to VTK"""
+        """Write tissue field data to VTK with proper time information for animation"""
         field_data = self.tissue_field.get_field_visualization_data()
         X, Y, Z = field_data['coordinates']
         
         # Create structured grid
         grid = vtk.vtkStructuredGrid()
         grid.SetDimensions(*self.tissue_field.grid_resolution)
+        
+        # Add time information to the dataset
+        time_array = vtk.vtkDoubleArray()
+        time_array.SetName("TimeValue")
+        time_array.SetNumberOfTuples(1)
+        time_array.SetValue(0, self.time)
+        grid.GetFieldData().AddArray(time_array)
         
         # Add points
         points = vtk.vtkPoints()
@@ -568,35 +633,75 @@ class MeshBasedSporozoiteSimulation:
                        f"motility={motility:.3f}\n")
     
     def _write_paraview_instructions(self):
-        """Write instructions for loading data in ParaView"""
+        """Write comprehensive instructions for loading data in ParaView with animation"""
         instructions_file = os.path.join(self.output_dir, "ParaView_Instructions.txt")
         
         with open(instructions_file, 'w') as f:
-            f.write("ParaView Visualization Instructions\n")
-            f.write("====================================\n\n")
-            f.write("To visualize the mesh-based sporozoite simulation:\n\n")
+            f.write("ParaView Animation Instructions - UPDATED FOR TIME SERIES\n")
+            f.write("=========================================================\n\n")            
+            f.write(" ANIMATION SETUP (MOST IMPORTANT):\n")
+            f.write("====================================\n")
             f.write("1. Open ParaView\n")
             f.write("2. Load sporozoite data:\n")
-            f.write("   - File > Open > sporozoites_*.vtm (select all)\n")
-            f.write("   - Click 'Apply' in Properties panel\n")
-            f.write("   - In toolbar, click the 'Play' button to animate\n\n")
-            f.write("3. Load tissue field data:\n")
+            f.write("   - File > Open > Browse to this simulation folder\n")
+            f.write("   - Select ALL sporozoites_*.vtm files (Ctrl+A or Cmd+A)\n")
+            f.write("   - Click 'OK'\n")
+            f.write("   - In Properties panel, click 'Apply'\n\n")
+            f.write("3.  ENABLE TIME SERIES ANIMATION:\n")
+            f.write("   - Look at the bottom toolbar for time controls\n")
+            f.write("   - You should see time range (0.0 to max simulation time)\n")
+            f.write("   - Click the PLAY button ▶ to animate\n")
+            f.write("   - Use the time slider to scrub through time\n\n")
+            f.write("4. If animation doesn't work:\n")
+            f.write("   - Check that you selected ALL vtm files, not just one\n")
+            f.write("   - Look for 'TimeValue' in Information tab\n")
+            f.write("   - Try: View > Animation View to see timeline\n\n")
+            f.write("🔧 VISUALIZATION SETUP:\n")
+            f.write("=======================\n")
+            f.write("1. Color sporozoites:\n")
+            f.write("   - In Properties panel, find 'Coloring'\n")
+            f.write("   - Change from 'Solid Color' to 'Viability' or 'SporozoiteID'\n")
+            f.write("   - Click 'Apply'\n\n")
+            f.write("2. Load tissue field (optional):\n")
             f.write("   - File > Open > tissue_field_*.vts (select all)\n")
             f.write("   - Click 'Apply'\n")
-            f.write("   - Change representation to 'Volume' for 3D field visualization\n")
-            f.write("   - Or use 'Slice' filter to see cross-sections\n\n")
-            f.write("4. Visualization tips:\n")
+            f.write("   - Change representation to 'Volume' or 'Outline'\n\n")
+            f.write("3. Advanced visualization:\n")
             f.write("   - Use 'Glyph' filter on flow field vectors\n")
-            f.write("   - Color sporozoites by 'Viability' or 'VelocityMagnitude'\n")
             f.write("   - Add 'Streamlines' to show flow patterns\n")
             f.write("   - Use 'Clip' filter to see internal structure\n\n")
-            f.write("5. Animation:\n")
-            f.write("   - Set animation mode to 'Real Time'\n")
-            f.write("   - Adjust time step size for smooth playback\n\n")
-            f.write("Data fields available:\n")
-            f.write("- Sporozoites: Viability, VelocityMagnitude, Motility, SporozoiteID\n")
-            f.write("- Tissue: CollagenDensity, ImmuneCellDensity, Pressure, FlowField\n")
-
+            f.write(" AVAILABLE DATA FIELDS:\n")
+            f.write("=========================\n")
+            f.write("Sporozoites:\n")
+            f.write("- Viability: Health of sporozoite (0-1)\n")
+            f.write("- VelocityMagnitude: Speed of movement\n")
+            f.write("- Motility: Movement capability (0-1)\n")
+            f.write("- SporozoiteID: Unique identifier for tracking\n")
+            f.write("- TimeValue: Current simulation time\n\n")
+            f.write("Tissue:\n")
+            f.write("- CollagenDensity: Structural protein density\n")
+            f.write("- ImmuneCellDensity: Immune response strength\n")
+            f.write("- Pressure: Tissue pressure field\n")
+            f.write("- FlowField: Tissue fluid flow (vector)\n\n")
+            f.write(" TROUBLESHOOTING:\n")
+            f.write("==================\n")
+            f.write("Problem: 'Time=1' and no animation\n")
+            f.write("Solution: Make sure you loaded ALL .vtm files as a series\n\n")
+            f.write("Problem: Files don't load\n")
+            f.write("Solution: Check file paths, use File > Open to browse\n\n")
+            f.write("Problem: Animation too fast/slow\n")
+            f.write("Solution: View > Animation View > adjust time settings\n\n")
+            f.write("Problem: Can't see sporozoites\n")
+            f.write("Solution: Zoom out, check visibility eye icon, adjust opacity\n\n")
+            f.write(f" Simulation Details:\n")
+            f.write(f"=====================\n")
+            f.write(f"Total time steps: Expected multiple files\n")
+            f.write(f"Time range: 0.0 to {self.max_time:.2f}\n")
+            f.write(f"Output interval: {self.config.OUTPUT_INTERVAL}\n")
+            f.write(f"Domain size: {self.domain_size}\n")
+            f.write(f"Spring constant: {self.config.SPRING_CONSTANT_BASE}\n")
+            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    
     def _write_paraview_state_file(self):
         """Write ParaView state file for automatic setup"""
         state_file = os.path.join(self.output_dir, "simulation_setup.pvsm")
@@ -671,7 +776,140 @@ class MeshBasedSporozoiteSimulation:
             f.write(state_content)
         
         print(f"ParaView state file created: {state_file}")
-        print("Load this file in ParaView for automatic setup!")
+    
+    def write_vtk_output(self, step_number: int):
+        """Write VTK files for current simulation state"""
+        # Write sporozoite meshes
+        self._write_sporozoite_vtk(step_number)
+        
+        # Write tissue field data
+        self._write_tissue_field_vtk(step_number)
+        
+        # Write simulation state info
+        self._write_simulation_state(step_number)
+        
+        # Write presets configuration file (only once at the beginning)
+        if step_number == 0:
+            self._write_presets_config_file()
+            self._write_time_series_collection_file()
+    
+    def _write_time_series_collection_file(self):
+        """Write a ParaView time series collection file for proper animation"""
+        # This creates a .pvd file that explicitly tells ParaView about the time series
+        collection_file = os.path.join(self.output_dir, "sporozoites_timeseries.pvd")
+        
+        with open(collection_file, 'w') as f:
+            f.write('<?xml version="1.0"?>\n')
+            f.write('<VTKFile type="Collection" version="0.1">\n')
+            f.write('  <Collection>\n')
+            
+            # We'll need to update this file each time we write output
+            # For now, just create the header
+            f.write('    <!-- Time series data will be added here -->\n')
+            f.write('  </Collection>\n')
+            f.write('</VTKFile>\n')
+        
+        # Store the collection file path for updates
+        self.collection_file_path = collection_file
+    
+    def _update_time_series_collection(self, step_number: int):
+        """Update the time series collection file with new time step"""
+        if not hasattr(self, 'collection_file_path'):
+            return
+            
+        # Read existing content
+        try:
+            with open(self.collection_file_path, 'r') as f:
+                lines = f.readlines()
+        except:
+            return
+        
+        # Find the insertion point (before </Collection>)
+        insert_index = -1
+        for i, line in enumerate(lines):
+            if '</Collection>' in line:
+                insert_index = i
+                break
+        
+        if insert_index == -1:
+            return
+        
+        # Create the new entry
+        vtm_file = f"sporozoites_{step_number:04d}.vtm"
+        new_entry = f'    <DataSet timestep="{self.time:.6f}" group="" part="0" file="{vtm_file}"/>\n'
+        
+        # Insert the new entry
+        lines.insert(insert_index, new_entry)
+        
+        # Write back the updated file
+        with open(self.collection_file_path, 'w') as f:
+            # Remove the comment line if it exists
+            for line in lines:
+                if '<!-- Time series data will be added here -->' not in line:
+                    f.write(line)
+
+    def run_simulation(self):
+        """Run the complete mesh-based simulation"""
+        print("\nStarting mesh-based sporozoite simulation...")
+        print(f"Domain size: {self.domain_size}")
+        print(f"Time step: {self.dt}")
+        print(f"Max time: {self.max_time}")
+        print(f"Output directory: {self.output_dir}")
+        print("-" * 60)
+        
+        step_count = 0
+        output_count = 0
+        
+        # Initial output
+        print(f"Writing initial state...")
+        self.write_vtk_output(output_count)
+        output_count += 1
+        self.last_output_time = self.time
+        
+        start_time = time.time()
+        
+        while self.time < self.max_time and len(self.sporozoites) > 0:
+            # Update simulation
+            self.update_simulation_step()
+            self.time += self.dt
+            step_count += 1
+            
+            # Output VTK files at intervals
+            if self.time - self.last_output_time >= self.output_interval:
+                self.write_vtk_output(output_count)
+                output_count += 1
+                self.last_output_time = self.time
+                
+                # Progress report
+                elapsed = time.time() - start_time
+                print(f"Time: {self.time:6.2f} | "
+                      f"Active: {len(self.sporozoites):2d} | "
+                      f"Avg motility: {self.stats['average_motility']:.3f} | "
+                      f"Elapsed: {elapsed:.1f}s")
+            
+            # Safety check for very long simulations
+            if step_count > 100000:
+                print("Maximum step count reached, ending simulation")
+                break
+        
+        # Final output
+        if output_count == 0 or self.time - self.last_output_time > 0.1:
+            print("Writing final state...")
+            self.write_vtk_output(output_count)
+        
+        total_time = time.time() - start_time
+        
+        print(f"\nSimulation completed!")
+        print(f"Total simulation time: {self.time:.2f}")
+        print(f"Total computation time: {total_time:.1f}s")
+        print(f"Final active sporozoites: {len(self.sporozoites)}")
+        print(f"VTK files written to: {self.output_dir}")
+        print(f"Total VTK outputs: {output_count + 1}")
+        
+        # Write ParaView state file
+        self._write_paraview_instructions()
+        self._write_paraview_state_file()
+        
 
 def main():
     """Main function with command line arguments and movement presets"""
@@ -700,6 +938,8 @@ def main():
                        help='Override undulation amplitude')
     parser.add_argument('--damping', type=float,
                        help='Override damping factor')
+    parser.add_argument('--spring-constant', type=float,
+                       help='Override spring constant (lower = more deformation)')
     
     args = parser.parse_args()
     
@@ -736,6 +976,10 @@ def main():
     if args.damping is not None:
         config.DAMPING_FACTOR = args.damping
         print(f"Overriding damping factor to: {args.damping}")
+    
+    if args.spring_constant is not None:
+        config.SPRING_CONSTANT_BASE = args.spring_constant
+        print(f"Overriding spring constant to: {args.spring_constant}")
     
     # Override time and output interval from args
     config.MAX_TIME = args.time

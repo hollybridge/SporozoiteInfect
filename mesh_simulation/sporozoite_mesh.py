@@ -45,6 +45,7 @@ class DeformableSporozoiteMesh:
         # Physical state
         self.viability = 1.0
         
+        '''
         # DEBUG: Print sporozoite initialization parameters
         print(f"\n=== SPOROZOITE {sporozoite_id} INITIALIZATION DEBUG ===")
         print(f"  ID: {self.id}")
@@ -58,6 +59,7 @@ class DeformableSporozoiteMesh:
         print(f"  Undulation frequency: {self.undulation_frequency:.3f} Hz")
         print(f"  Max speed: {self.max_speed:.3f}")
         print(f"  Initial viability: {self.viability}")
+        '''
         
         # Create mesh geometry
         self.vertices = None
@@ -178,6 +180,9 @@ class DeformableSporozoiteMesh:
         # Convert to numpy and position correctly
         vertices = np.array(vertices)
         
+        # Store original relative positions BEFORE adding center position
+        self.original_relative_positions = vertices.copy()
+        
         # NOW add the center position to all vertices
         for i in range(len(vertices)):
             vertices[i] += self.center_position
@@ -187,6 +192,7 @@ class DeformableSporozoiteMesh:
         self.original_vertices = self.vertices.copy()  # rest state
         
         # DEBUG: Print mesh creation info
+        '''
         print(f"MESH CREATION DEBUG for sporozoite {self.id}:")
         print(f"  Created {len(vertices)} vertices, {len(faces)} faces")
         print(f"  Vertex range X: [{np.min(vertices[:, 0]):.3f}, {np.max(vertices[:, 0]):.3f}]")
@@ -195,6 +201,7 @@ class DeformableSporozoiteMesh:
         print(f"  First 3 vertices:")
         for i in range(min(3, len(vertices))):
             print(f"    Vertex {i}: {vertices[i]}")
+        '''
         
         # Calculate vertex normals
         self._calculate_vertex_normals()
@@ -292,55 +299,267 @@ class DeformableSporozoiteMesh:
             undulation_force = np.array([0, undulation_y, undulation_z]) * self.config.UNDULATION_FORCE_SCALE * self.motility
             self.forces[i] += undulation_force
     
-    def update_motion(self, dt: float, time: float):
-        """Update sporozoite motion - COMPLETELY RIGID APPROACH WITH SIMPLIFIED DEBUGGING"""
-        # Store original relative positions to maintain exact shape
-        if not hasattr(self, 'original_relative_positions'):
-            self.original_relative_positions = []
-            for vertex in self.vertices:
-                relative_pos = vertex - self.center_position
-                self.original_relative_positions.append(relative_pos.copy())
+    def apply_deformation_forces(self, dt: float):
+        """Apply spring-based deformation forces to vertices"""
+        # Reset forces
+        self.forces = np.zeros_like(self.vertices)
         
-        # Store previous position for movement calculation
-        prev_center = self.center_position.copy()
+        # Spring forces between connected vertices
+        spring_constant = self.config.SPRING_CONSTANT_BASE * self.stiffness
         
-        # Calculate center of mass movement (pure translation)
-        directional_force = np.array([np.cos(self.direction), np.sin(self.direction), 0])
-        directional_force *= self.motility * self.config.DIRECTIONAL_FORCE_STRENGTH
+        for i, (v1, v2) in enumerate(self.edge_list):
+            if i < len(self.rest_lengths):
+                current_vec = self.vertices[v2] - self.vertices[v1]
+                current_length = np.linalg.norm(current_vec)
+                
+                if current_length > 1e-8:  # Avoid division by zero
+                    # Spring force (Hooke's law)
+                    extension = current_length - self.rest_lengths[i]
+                    force_magnitude = spring_constant * extension
+                    force_direction = current_vec / current_length
+                    
+                    # Apply equal and opposite forces
+                    force = force_magnitude * force_direction
+                    self.forces[v1] += force
+                    self.forces[v2] -= force
         
-        # Add tiny amount of undulation to center position only
-        phase = self.undulation_phase + time * self.undulation_frequency * 2 * np.pi
-        undulation_displacement = np.array([0, 
-                                          self.config.UNDULATION_AMPLITUDE * np.sin(phase) * 0.1,
-                                          self.config.UNDULATION_AMPLITUDE * np.cos(phase) * 0.05])
-        
-        # Update center position (rigid body motion)
-        acceleration = directional_force / self.config.MASS
-        velocity_change = acceleration * dt
-        displacement = velocity_change * dt + undulation_displacement * dt
-        
-        self.center_position += displacement
-        
-        # COMPLETELY RIGID MOVEMENT - restore exact original shape
+        # Add damping to prevent oscillations
+        damping = self.config.DAMPING_FACTOR
         for i in range(len(self.vertices)):
+            self.forces[i] -= damping * self.velocity[i]
+    
+    def apply_undulation_deformation(self, time: float):
+        """Apply undulatory deformation forces to create swimming motion"""
+        phase = self.undulation_phase + time * self.undulation_frequency * 2 * np.pi
+        
+        # Apply undulation forces that actually deform the mesh
+        for i, vertex in enumerate(self.vertices):
+            relative_pos = vertex - self.center_position
+            
+            # Calculate distance along sporozoite body (approximate)
+            body_position = np.dot(relative_pos, [np.cos(self.direction), np.sin(self.direction), 0])
+            normalized_position = body_position / (self.length/2) if self.length > 0 else 0
+            
+            # Undulation forces perpendicular to movement direction
+            perpendicular = np.array([-np.sin(self.direction), np.cos(self.direction), 0])
+            vertical = np.array([0, 0, 1])
+            
+            # Sinusoidal deformation along the body
+            wave_amplitude = self.config.UNDULATION_AMPLITUDE * self.motility
+            lateral_force = perpendicular * wave_amplitude * np.sin(phase + normalized_position * 2 * np.pi)
+            vertical_force = vertical * wave_amplitude * np.cos(phase + normalized_position * 2 * np.pi) * 0.3
+            
+            undulation_force = (lateral_force + vertical_force) * self.config.UNDULATION_FORCE_SCALE
+            self.forces[i] += undulation_force
+
+    def update_motion(self, dt, forces, spring_constant=100.0, damping=0.5):
+        """
+        Update sporozoite motion with enhanced deformation capability.
+        
+        Args:
+            dt: Time step
+            forces: External forces dictionary
+            spring_constant: Stiffness of the mesh (lower = more flexible)
+            damping: Damping factor for stability (higher = more stable)
+        """
+        if not self.is_alive:
+            return
+            
+        # Apply motility and viability effects - ENHANCED FOR DEFORMATION
+        effective_spring = spring_constant * self.viability * 0.3  # Much weaker restoring forces
+        effective_damping = damping * (1.5 - self.motility)  # Less damping for more movement
+        
+        # Use more substeps for very flexible meshes (low spring constant)
+        if spring_constant < 20.0:
+            num_substeps = max(3, int(dt / 0.008))  # More substeps for stability with very flexible meshes
+        else:
+            num_substeps = max(1, int(dt / 0.01))
+        substep_dt = dt / num_substeps
+        
+        for _ in range(num_substeps):
+            self._update_physics_substep_deformable(substep_dt, forces, effective_spring, effective_damping)
+    
+    def _update_physics_substep_deformable(self, dt, forces, spring_constant, damping):
+        """Enhanced physics substep that allows significant but controlled deformation."""
+        
+        # Initialize velocities if not present
+        if not hasattr(self, 'vertex_velocities'):
+            self.vertex_velocities = [np.zeros(3) for _ in range(len(self.vertices))]
+        
+        # Calculate center position and movement
+        old_center = self.center_position.copy()
+        
+        # Apply external forces to center
+        center_force = np.zeros(3)
+        if 'directional' in forces:
+            center_force += forces['directional']
+        if 'random' in forces:
+            center_force += forces['random']
+        if 'boundary_repulsion' in forces:
+            center_force += forces['boundary_repulsion']
+        
+        # Update center position with damping
+        center_acceleration = center_force * self.motility
+        center_velocity = getattr(self, 'center_velocity', np.zeros(3))
+        center_velocity = center_velocity * (1.0 - damping * dt * 0.5) + center_acceleration * dt
+        self.center_position += center_velocity * dt
+        self.center_velocity = center_velocity
+        
+        # Calculate forces on each vertex with CONTROLLED deformation
+        vertex_forces = []
+        for i, vertex in enumerate(self.vertices):
+            force = np.zeros(3)
+            
+            # CONTROLLED restoring force to original shape
             if i < len(self.original_relative_positions):
-                # Maintain EXACT original relative positions - no deformation at all
-                new_vertex = self.center_position + self.original_relative_positions[i]
-                self.vertices[i] = new_vertex
+                target_position = self.center_position + self.original_relative_positions[i]
+                displacement = target_position - vertex
+                
+                # Make restoring force proportional to displacement but not too weak
+                distance_from_rest = np.linalg.norm(displacement)
+                
+                # Gradual increase in restoring force based on distance
+                if distance_from_rest > self.length * 0.4:  
+                    # Strong restoration when very deformed (beyond 40% of length)
+                    spring_force = displacement * spring_constant * 5.0
+                elif distance_from_rest > self.length * 0.2:  
+                    # Moderate restoration for significant deformation (20-40% of length)
+                    spring_force = displacement * spring_constant * 1.0
+                else:
+                    # Weak restoration for small deformation (< 20% of length)
+                    spring_force = displacement * spring_constant * 0.3
+                
+                # For very flexible meshes, reduce all restoring forces but don't eliminate them
+                if spring_constant < 20.0:
+                    spring_force *= 0.5  # Reduce but don't eliminate
+                
+                force += spring_force
+            
+            # CONTROLLED undulation forces for visible but stable deformation
+            if 'undulation' in forces and i < len(forces['undulation']):
+                undulation_force = forces['undulation'][i]
+                
+                # Scale undulation force based on spring constant but limit maximum
+                if spring_constant < 20.0:
+                    undulation_scale = min(2.0, 50.0 / max(1.0, spring_constant))  # Cap at 2x scale
+                else:
+                    undulation_scale = 0.5
+                
+                undulation_force *= undulation_scale
+                
+                # Limit undulation force magnitude to prevent instability
+                force_magnitude = np.linalg.norm(undulation_force)
+                max_undulation_force = self.length * 2.0  # Reasonable limit based on sporozoite size
+                if force_magnitude > max_undulation_force:
+                    undulation_force = undulation_force * (max_undulation_force / force_magnitude)
+                
+                force += undulation_force
+            
+            vertex_forces.append(force)
         
-        # Update velocity array for VTK output (all vertices move together)
-        center_velocity = displacement / dt if dt > 0 else np.array([0.0, 0.0, 0.0])
-        for i in range(len(self.velocity)):
-            self.velocity[i] = center_velocity
+        # Apply neighbor-based spring forces for shape coherence with better control
+        if hasattr(self, 'edge_list') and hasattr(self, 'rest_lengths'):
+            for edge_idx, (v1, v2) in enumerate(self.edge_list):
+                if edge_idx < len(self.rest_lengths) and v1 < len(vertex_forces) and v2 < len(vertex_forces):
+                    current_vec = self.vertices[v2] - self.vertices[v1]
+                    current_length = np.linalg.norm(current_vec)
+                    
+                    if current_length > 1e-8:
+                        rest_length = self.rest_lengths[edge_idx]
+                        
+                        # Allow reasonable deformation but prevent extreme distortion
+                        if spring_constant < 20.0:
+                            # Flexible: allow 30% extension/compression before strong forces
+                            max_extension = rest_length * 1.3
+                            max_compression = rest_length * 0.7
+                        else:
+                            # Normal: allow 15% extension/compression
+                            max_extension = rest_length * 1.15
+                            max_compression = rest_length * 0.85
+                        
+                        # Calculate force based on deformation level
+                        if current_length > max_extension:
+                            excess = current_length - max_extension
+                            force_magnitude = spring_constant * excess * 3.0  # Strong force to prevent tearing
+                        elif current_length < max_compression:
+                            excess = max_compression - current_length
+                            force_magnitude = spring_constant * excess * 3.0  # Strong force to prevent collapse
+                        else:
+                            # Within allowed range: gentle forces to maintain shape
+                            extension = current_length - rest_length
+                            force_magnitude = spring_constant * extension * 0.2  # Gentle internal forces
+                        
+                        # Limit maximum edge force to prevent instability
+                        max_edge_force = spring_constant * rest_length * 0.5
+                        if abs(force_magnitude) > max_edge_force:
+                            force_magnitude = max_edge_force * (1 if force_magnitude > 0 else -1)
+                        
+                        force_direction = current_vec / current_length
+                        edge_force = force_magnitude * force_direction
+                        
+                        # Distribute force to vertices
+                        vertex_forces[v1] += edge_force * 0.5
+                        vertex_forces[v2] -= edge_force * 0.5
         
-        # Random direction changes
-        if random.random() < self.config.RANDOM_DIRECTION_PROBABILITY:
-            direction_change = random.uniform(-self.config.MAX_DIRECTION_CHANGE, 
-                                            self.config.MAX_DIRECTION_CHANGE)
-            self.direction += direction_change
+        # Update vertex positions with enhanced stability controls
+        for i, (vertex, force) in enumerate(zip(self.vertices, vertex_forces)):
+            if i >= len(self.vertex_velocities):
+                continue
+                
+            # Apply force with controlled responsiveness
+            mass_factor = 0.8 if spring_constant < 20.0 else 1.0  # Slightly lower effective mass for flexible meshes
+            acceleration = force * mass_factor
+            
+            # Limit acceleration to prevent explosions
+            acc_magnitude = np.linalg.norm(acceleration)
+            max_acceleration = 1000.0  # Reasonable acceleration limit
+            if acc_magnitude > max_acceleration:
+                acceleration = acceleration * (max_acceleration / acc_magnitude)
+            
+            # Update velocity with controlled damping
+            velocity = self.vertex_velocities[i]
+            effective_damping_factor = damping * (0.8 if spring_constant < 20.0 else 1.0)
+            velocity = velocity * (1.0 - effective_damping_factor * dt) + acceleration * dt
+            
+            # Limit velocity for stability
+            max_velocity = 30.0 if spring_constant < 20.0 else 20.0  # Higher limit for flexible meshes but still controlled
+            velocity_magnitude = np.linalg.norm(velocity)
+            if velocity_magnitude > max_velocity:
+                velocity = velocity * (max_velocity / velocity_magnitude)
+            
+            # Update position
+            new_position = vertex + velocity * dt
+            
+            # Keep vertices within reasonable distance from center
+            max_distance = self.length * (1.2 if spring_constant < 20.0 else 1.0)  # Allow some extra distance for flexible meshes
+            position_magnitude = np.linalg.norm(new_position - self.center_position)
+            if position_magnitude > max_distance:
+                direction = (new_position - self.center_position) / position_magnitude
+                new_position = self.center_position + direction * max_distance
+                # Reduce velocity when constrained
+                velocity *= 0.7
+            
+            self.vertices[i] = new_position
+            self.vertex_velocities[i] = velocity
         
-        # Recalculate normals
-        self._calculate_vertex_normals()
+        # For very flexible meshes, allow slight center adjustment to follow deformation
+        if spring_constant < 15.0:  # Only for very flexible meshes
+            # Calculate actual center of vertices (excluding end caps if they exist)
+            vertex_count = len(self.vertices)
+            if vertex_count > 10:  # If we have end caps, exclude them
+                actual_center = np.mean(self.vertices[:-2], axis=0)
+            else:
+                actual_center = np.mean(self.vertices, axis=0)
+            
+            center_drift = actual_center - self.center_position
+            
+            # Allow small center drift to follow deformation, but limit it
+            max_drift = self.length * 0.05  # Very small drift allowed
+            drift_magnitude = np.linalg.norm(center_drift)
+            if drift_magnitude > max_drift:
+                center_drift = center_drift * (max_drift / drift_magnitude)
+            
+            self.center_position += center_drift * 0.05  # Very gradual center adjustment
     
     def to_vtk_polydata(self) -> vtk.vtkPolyData:
         """Convert mesh to VTK PolyData for visualization"""
@@ -363,7 +582,7 @@ class DeformableSporozoiteMesh:
         polydata.SetPolys(polys)
         
         # DEBUG: Print sporozoite ID being written to VTK
-        print(f"VTK DEBUG: Writing sporozoite ID {self.id} to polydata with {len(self.vertices)} vertices")
+        #print(f"VTK DEBUG: Writing sporozoite ID {self.id} to polydata with {len(self.vertices)} vertices")
         
         # Add vertex data
         # Viability
@@ -394,17 +613,17 @@ class DeformableSporozoiteMesh:
         for vertex_idx in range(len(self.vertices)):
             id_array.InsertNextValue(self.id)
             # DEBUG: Print first few ID assignments
-            if vertex_idx < 3:
-                print(f"  VTK DEBUG: Vertex {vertex_idx} assigned ID {self.id}")
+            #if vertex_idx < 3:
+                #print(f"  VTK DEBUG: Vertex {vertex_idx} assigned ID {self.id}")
         polydata.GetPointData().AddArray(id_array)
         
         # DEBUG: Verify the ID array was created correctly
         retrieved_id_array = polydata.GetPointData().GetArray("SporozoiteID")
         if retrieved_id_array:
-            print(f"  VTK DEBUG: ID array created with {retrieved_id_array.GetNumberOfTuples()} values")
+            #print(f"  VTK DEBUG: ID array created with {retrieved_id_array.GetNumberOfTuples()} values")
             if retrieved_id_array.GetNumberOfTuples() > 0:
                 first_id = retrieved_id_array.GetValue(0)
-                print(f"  VTK DEBUG: First ID value in array: {first_id}")
+                #print(f"  VTK DEBUG: First ID value in array: {first_id}")
         else:
             print(f"  VTK ERROR: Failed to create SporozoiteID array!")
         
@@ -423,3 +642,8 @@ class DeformableSporozoiteMesh:
     def reduce_viability(self, amount: float):
         """Reduce viability due to environmental stress"""
         self.viability = max(0.0, self.viability - amount)
+    
+    @property
+    def is_alive(self) -> bool:
+        """Check if sporozoite is still alive"""
+        return self.viability > 0.1
