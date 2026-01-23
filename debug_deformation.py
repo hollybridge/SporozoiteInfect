@@ -18,7 +18,7 @@ import numpy as np
 def run_gentle_flexible_debug():
     """Run mesh simulation with gentle flexible preset for deformation debugging"""
     
-    print("🔬 SPOROZOITE DEFORMATION DEBUG SESSION")
+    print(" SPOROZOITE DEFORMATION DEBUG SESSION")
     print("="*60)
     
     # Change to mesh_simulation directory
@@ -103,7 +103,7 @@ def analyze_simulation_output(output_text):
             print(f"   ... and {len(boundary_warnings) - 5} more warnings")
     
     if boundary_corrections:
-        print(f"\n🔧 BOUNDARY CORRECTIONS APPLIED:")
+        print(f"\nBOUNDARY CORRECTIONS APPLIED:")
         for correction in boundary_corrections[:5]:  # Show first 5
             print(f"   {correction}")
         if len(boundary_corrections) > 5:
@@ -111,7 +111,7 @@ def analyze_simulation_output(output_text):
     
     # Movement analysis
     if sporozoite_movements:
-        print(f"\n🏃 MOVEMENT SUMMARY (last few steps):")
+        print(f"\n MOVEMENT SUMMARY (last few steps):")
         for movement in sporozoite_movements[-6:]:  # Show last 6 movements
             print(f"   {movement}")
     
