@@ -45,21 +45,18 @@ class DeformableSporozoiteMesh:
         # Physical state
         self.viability = 1.0
         
-        '''
-        # DEBUG: Print sporozoite initialization parameters
-        print(f"\n=== SPOROZOITE {sporozoite_id} INITIALIZATION DEBUG ===")
-        print(f"  ID: {self.id}")
-        print(f"  Initial position: {self.center_position}")
-        print(f"  Length: {self.length:.3f}")
-        print(f"  Diameter: {self.diameter:.3f}")
-        print(f"  Motility: {self.motility:.3f}")
-        print(f"  Stiffness: {self.stiffness:.3f}")
-        print(f"  Direction: {self.direction:.3f} rad ({np.degrees(self.direction):.1f}°)")
-        print(f"  Undulation phase: {self.undulation_phase:.3f} rad")
-        print(f"  Undulation frequency: {self.undulation_frequency:.3f} Hz")
-        print(f"  Max speed: {self.max_speed:.3f}")
-        print(f"  Initial viability: {self.viability}")
-        '''
+        # NEW: Péclet number and activity-flow coupling parameters - ADJUSTED FOR BIOLOGICAL REALISM
+        # Sporozoite diffusivity should be higher to reflect active swimming capability
+        # Typical active matter: D ~ v²τ where v~10-50 μm/s, τ~0.1-1 s → D~10-2500 μm²/s
+        self.diffusion_coefficient = 0.1 * self.motility  # Scale with motility, typical range 10-50 μm²/s change back to 50
+        self.peclet_number = 0.0  # Will be calculated dynamically
+        self.activity_level = self.motility  # Base activity level
+        self.flow_regime = "activity_dominated"  # Can be "activity_dominated" or "flow_dominated"
+        
+        # NEW: Dynamic deformation coupling parameters
+        self.base_spring_constant = self.config.SPRING_CONSTANT_BASE
+        self.activity_induced_flexibility = 0.0  # How much activity reduces stiffness
+        self.flow_induced_flexibility = 0.0     # How much flow reduces stiffness
         
         # Create mesh geometry
         self.vertices = None
@@ -270,15 +267,191 @@ class DeformableSporozoiteMesh:
         
         self.rest_lengths = np.array(self.rest_lengths)
     
+    def calculate_peclet_number(self, flow_velocity: np.ndarray) -> float:
+        """Calculate Péclet number: Pe = UL/D where U=flow speed, L=characteristic length, D=diffusivity"""
+        flow_speed = np.linalg.norm(flow_velocity)
+        characteristic_length = self.length  # Use sporozoite length as characteristic scale
+        
+        # Avoid division by zero
+        if self.diffusion_coefficient > 1e-8:
+            peclet_number = flow_speed * characteristic_length / self.diffusion_coefficient
+        else:
+            peclet_number = 0.0
+            
+        return peclet_number
+    
+    def update_flow_regime(self, flow_velocity: np.ndarray, threshold_pe: float = 1.0):
+        """Update flow regime based on Péclet number"""
+        self.peclet_number = self.calculate_peclet_number(flow_velocity)
+        
+        if self.peclet_number > threshold_pe:
+            self.flow_regime = "flow_dominated"  # Pe >> 1: advection dominates
+        else:
+            self.flow_regime = "activity_dominated"  # Pe << 1: sporozoite activity dominates
+    
+    def calculate_activity_deformation_coupling(self) -> float:
+        """Calculate how sporozoite activity affects its deformability"""
+        # Higher activity -> more flexible (lower spring constant)
+        # Model: active sporozoites reduce their cytoskeletal stiffness to enable movement
+        
+        if self.flow_regime == "activity_dominated":
+            # In activity-dominated regime, sporozoite controls its own deformation
+            # High activity leads to increased flexibility for swimming
+            activity_flexibility_factor = self.activity_level * 0.8  # Max 80% reduction in stiffness
+        else:
+            # In flow-dominated regime, sporozoite tries to maintain structure against flow
+            # Reduced flexibility to resist deformation
+            activity_flexibility_factor = self.activity_level * 0.2  # Max 20% reduction in stiffness
+        
+        self.activity_induced_flexibility = activity_flexibility_factor
+        return activity_flexibility_factor
+    
+    def calculate_flow_deformation_coupling(self, flow_velocity: np.ndarray, shear_rate: float = 0.0) -> float:
+        """Calculate how flow forces affect sporozoite deformability"""
+        flow_speed = np.linalg.norm(flow_velocity)
+        
+        if self.flow_regime == "flow_dominated":
+            # In high Pe regime: flow forces cause passive deformation
+            # Higher flow speed -> more deformation
+            # Model: flow-induced deformation scales with flow velocity and shear
+            flow_deformation_factor = min(0.7, flow_speed / 100.0)  # Scale with flow speed, max 70% flexibility
+            shear_deformation_factor = min(0.5, abs(shear_rate) / 50.0)  # Scale with shear rate, max 50% flexibility
+            total_flow_flexibility = flow_deformation_factor + shear_deformation_factor
+        else:
+            # In activity-dominated regime: minimal flow-induced deformation
+            total_flow_flexibility = min(0.1, flow_speed / 200.0)  # Very small effect, max 10%
+        
+        self.flow_induced_flexibility = total_flow_flexibility
+        return total_flow_flexibility
+    
+    def get_effective_spring_constant(self) -> float:
+        """Calculate effective spring constant based on activity and flow coupling"""
+        # Base spring constant modified by both activity and flow effects
+        activity_factor = 1.0 - self.activity_induced_flexibility  # Reduces stiffness
+        flow_factor = 1.0 - self.flow_induced_flexibility          # Reduces stiffness
+        
+        # Combined effect: both activity and flow can make sporozoite more flexible
+        combined_flexibility = self.activity_induced_flexibility + self.flow_induced_flexibility
+        combined_flexibility = min(0.9, combined_flexibility)  # Cap at 90% flexibility increase
+        
+        effective_stiffness_factor = 1.0 - combined_flexibility
+        effective_spring_constant = self.base_spring_constant * effective_stiffness_factor
+        
+        # Ensure minimum stiffness to prevent mesh collapse
+        min_spring_constant = self.base_spring_constant * 0.1
+        effective_spring_constant = max(min_spring_constant, effective_spring_constant)
+        
+        return effective_spring_constant
+    
+    def update_activity_level(self, flow_velocity: np.ndarray):
+        """Update sporozoite activity level based on flow conditions"""
+        flow_speed = np.linalg.norm(flow_velocity)
+        
+        if self.flow_regime == "flow_dominated":
+            # In high Pe regime: sporozoite activity is overwhelmed by flow
+            # Reduce effective activity as flow becomes dominant
+            flow_suppression_factor = min(0.8, self.peclet_number / 10.0)  # Up to 80% suppression
+            self.activity_level = self.motility * (1.0 - flow_suppression_factor)
+        else:
+            # In activity-dominated regime: sporozoite maintains full activity
+            self.activity_level = self.motility
+        
+        # Ensure minimum activity level
+        self.activity_level = max(0.1, self.activity_level)
+    
     def apply_tissue_forces(self, tissue_field, dt: float):
-        """Apply forces from implicit tissue field - SIMPLIFIED FOR RIGID BODY"""
-        # Only apply forces to center of mass, not individual vertices
+        """Apply forces from implicit tissue field or blood flow field - ENHANCED WITH PÉCLET PHYSICS"""
+        # Get forces at center of mass
         center_resistance = tissue_field.get_resistance_at_point(self.center_position)
         center_flow = tissue_field.get_flow_field_at_point(self.center_position)
         
-        # These forces will be applied in update_motion as modifications to center movement
-        self.tissue_resistance_force = -center_resistance * 0.1  # Reduce tissue effects
-        self.tissue_flow_force = center_flow * 0.05
+        # Check if this is a blood flow field (has velocity methods)
+        if hasattr(tissue_field, 'get_velocity_at_point'):
+            # This is a blood flow field - apply Péclet number physics
+            blood_velocity = tissue_field.get_velocity_at_point(self.center_position)
+            
+            # NEW: Update flow regime based on Péclet number
+            self.update_flow_regime(blood_velocity, threshold_pe=1.0)
+            
+            # NEW: Update activity level based on flow conditions
+            self.update_activity_level(blood_velocity)
+            
+            # NEW: Calculate activity-deformation coupling
+            self.calculate_activity_deformation_coupling()
+            
+            # NEW: Calculate flow-deformation coupling
+            shear_rate = 0.0
+            if hasattr(tissue_field, 'get_shear_rate_at_point'):
+                shear_rate = tissue_field.get_shear_rate_at_point(self.center_position)
+                if isinstance(shear_rate, np.ndarray):
+                    shear_rate = float(shear_rate.flatten()[0])
+                else:
+                    shear_rate = float(shear_rate)
+            
+            self.calculate_flow_deformation_coupling(blood_velocity, shear_rate)
+            
+            # Apply drag force based on flow regime
+            if self.flow_regime == "flow_dominated":
+                # High Pe regime: strong drag coupling, sporozoite is passively advected
+                sporozoite_velocity = np.array([
+                    np.cos(self.direction), 
+                    np.sin(self.direction), 
+                    0
+                ]) * self.activity_level * 5.0  # Reduced effective velocity due to flow suppression
+                
+                relative_velocity = blood_velocity - sporozoite_velocity
+                drag_coefficient = 0.8 * (1.0 + self.peclet_number / 10.0)  # Stronger drag at high Pe
+                self.tissue_flow_force = relative_velocity * drag_coefficient
+                
+            else:
+                # Activity-dominated regime: weaker drag coupling, sporozoite controls motion
+                sporozoite_velocity = np.array([
+                    np.cos(self.direction), 
+                    np.sin(self.direction), 
+                    0
+                ]) * self.activity_level * 10.0  # Full effective velocity
+                
+                relative_velocity = blood_velocity - sporozoite_velocity
+                drag_coefficient = 0.3 * self.motility  # Weaker drag, activity dominates
+                self.tissue_flow_force = relative_velocity * drag_coefficient
+            
+            # Shear resistance based on regime
+            if self.flow_regime == "flow_dominated":
+                # Strong shear resistance in high Pe regime
+                shear_resistance = np.array([-shear_rate * 0.2, 0, 0])
+            else:
+                # Weak shear resistance in activity-dominated regime
+                shear_resistance = np.array([-shear_rate * 0.05, 0, 0])
+                
+            self.tissue_resistance_force = shear_resistance
+                
+            # DEBUG: Print Péclet physics
+            if hasattr(self, '_debug_counter'):
+                self._debug_counter += 1
+            else:
+                self._debug_counter = 0
+                
+            if self._debug_counter % 50 == 0:  # Print occasionally
+                blood_vel_mag = np.linalg.norm(blood_velocity)
+                flow_force_mag = np.linalg.norm(self.tissue_flow_force)
+                print(f"  Péclet Physics DEBUG - Sporozoite {self.id}:")
+                print(f"    Blood velocity: {blood_velocity} (mag: {blood_vel_mag:.2f})")
+                print(f"    Péclet number: {self.peclet_number:.2f}")
+                print(f"    Flow regime: {self.flow_regime}")
+                print(f"    Activity level: {self.activity_level:.3f} (base: {self.motility:.3f})")
+                print(f"    Activity flexibility: {self.activity_induced_flexibility:.3f}")
+                print(f"    Flow flexibility: {self.flow_induced_flexibility:.3f}")
+                print(f"    Flow force: {self.tissue_flow_force} (mag: {flow_force_mag:.2f})")
+                
+        else:
+            # This is a tissue field - use original approach but with activity coupling
+            self.flow_regime = "activity_dominated"  # No flow, so activity dominates
+            self.activity_level = self.motility  # Full activity
+            self.calculate_activity_deformation_coupling()
+            self.flow_induced_flexibility = 0.0  # No flow-induced flexibility
+            
+            self.tissue_resistance_force = -center_resistance * 0.1
+            self.tissue_flow_force = center_flow * 0.05
     
     def apply_undulation(self, time: float):
         """Apply very gentle undulatory motion - SIMPLIFIED VERSION"""
@@ -380,7 +553,7 @@ class DeformableSporozoiteMesh:
             self._update_physics_substep_deformable(substep_dt, forces, effective_spring, effective_damping)
     
     def _update_physics_substep_deformable(self, dt, forces, spring_constant, damping):
-        """Enhanced physics substep that allows significant but controlled deformation."""
+        """Enhanced physics substep with gentle vessel-aware constraints."""
         
         # Initialize velocities if not present
         if not hasattr(self, 'vertex_velocities'):
@@ -398,6 +571,12 @@ class DeformableSporozoiteMesh:
         if 'boundary_repulsion' in forces:
             center_force += forces['boundary_repulsion']
         
+        # Add blood flow forces if available
+        if hasattr(self, 'tissue_flow_force'):
+            center_force += self.tissue_flow_force
+        if hasattr(self, 'tissue_resistance_force'):
+            center_force += self.tissue_resistance_force
+        
         # Update center position with damping
         center_acceleration = center_force * self.motility
         center_velocity = getattr(self, 'center_velocity', np.zeros(3))
@@ -405,7 +584,7 @@ class DeformableSporozoiteMesh:
         self.center_position += center_velocity * dt
         self.center_velocity = center_velocity
         
-        # Calculate forces on each vertex with CONTROLLED deformation
+        # Calculate forces on each vertex with GENTLE vessel awareness
         vertex_forces = []
         for i, vertex in enumerate(self.vertices):
             force = np.zeros(3)
@@ -435,7 +614,7 @@ class DeformableSporozoiteMesh:
                 
                 force += spring_force
             
-            # CONTROLLED undulation forces for visible but stable deformation
+            # GENTLE vessel-aware undulation forces
             if 'undulation' in forces and i < len(forces['undulation']):
                 undulation_force = forces['undulation'][i]
                 
@@ -447,9 +626,29 @@ class DeformableSporozoiteMesh:
                 
                 undulation_force *= undulation_scale
                 
+                # GENTLE vessel constraint: only reduce outward forces if getting close to boundary
+                proposed_position = vertex + undulation_force * dt * dt  # Rough estimate
+                if self._would_vertex_exit_vessel(proposed_position):
+                    # Only apply gentle reduction, don't eliminate forces completely
+                    vessel_center_2d = np.array([12.5, 7.5])  # Assuming domain center
+                    vertex_2d = proposed_position[1:3]  # Y, Z coordinates
+                    radial_direction = vertex_2d - vessel_center_2d
+                    radial_distance = np.linalg.norm(radial_direction)
+                    
+                    if radial_distance > 1e-6:
+                        radial_unit = radial_direction / radial_distance
+                        # Project undulation force and gently reduce radial component
+                        force_2d = undulation_force[1:3]  # Y, Z components
+                        radial_component = np.dot(force_2d, radial_unit)
+                        if radial_component > 0:  # Outward force
+                            # Gently reduce outward radial component instead of eliminating it
+                            reduction_factor = 0.5  # Reduce by 50% instead of 100%
+                            force_2d -= radial_component * radial_unit * reduction_factor
+                            undulation_force[1:3] = force_2d
+                
                 # Limit undulation force magnitude to prevent instability
                 force_magnitude = np.linalg.norm(undulation_force)
-                max_undulation_force = self.length * 2.0  # Reasonable limit based on sporozoite size
+                max_undulation_force = self.length * 2.0  # Increased limit to allow more movement
                 if force_magnitude > max_undulation_force:
                     undulation_force = undulation_force * (max_undulation_force / force_magnitude)
                 
@@ -469,9 +668,9 @@ class DeformableSporozoiteMesh:
                         
                         # Allow reasonable deformation but prevent extreme distortion
                         if spring_constant < 20.0:
-                            # Flexible: allow 30% extension/compression before strong forces
-                            max_extension = rest_length * 1.3
-                            max_compression = rest_length * 0.7
+                            # Flexible: allow 25% extension/compression (more than before)
+                            max_extension = rest_length * 1.25
+                            max_compression = rest_length * 0.75
                         else:
                             # Normal: allow 15% extension/compression
                             max_extension = rest_length * 1.15
@@ -480,17 +679,17 @@ class DeformableSporozoiteMesh:
                         # Calculate force based on deformation level
                         if current_length > max_extension:
                             excess = current_length - max_extension
-                            force_magnitude = spring_constant * excess * 3.0  # Strong force to prevent tearing
+                            force_magnitude = spring_constant * excess * 2.0  # Reduced force strength
                         elif current_length < max_compression:
                             excess = max_compression - current_length
-                            force_magnitude = spring_constant * excess * 3.0  # Strong force to prevent collapse
+                            force_magnitude = spring_constant * excess * 2.0  # Reduced force strength
                         else:
                             # Within allowed range: gentle forces to maintain shape
                             extension = current_length - rest_length
-                            force_magnitude = spring_constant * extension * 0.2  # Gentle internal forces
+                            force_magnitude = spring_constant * extension * 0.1  # Very gentle internal forces
                         
                         # Limit maximum edge force to prevent instability
-                        max_edge_force = spring_constant * rest_length * 0.5
+                        max_edge_force = spring_constant * rest_length * 0.5  # Same limit
                         if abs(force_magnitude) > max_edge_force:
                             force_magnitude = max_edge_force * (1 if force_magnitude > 0 else -1)
                         
@@ -501,18 +700,18 @@ class DeformableSporozoiteMesh:
                         vertex_forces[v1] += edge_force * 0.5
                         vertex_forces[v2] -= edge_force * 0.5
         
-        # Update vertex positions with enhanced stability controls
+        # Update vertex positions with GENTLE vessel awareness
         for i, (vertex, force) in enumerate(zip(self.vertices, vertex_forces)):
             if i >= len(self.vertex_velocities):
                 continue
                 
             # Apply force with controlled responsiveness
-            mass_factor = 0.8 if spring_constant < 20.0 else 1.0  # Slightly lower effective mass for flexible meshes
+            mass_factor = 0.8 if spring_constant < 20.0 else 1.0
             acceleration = force * mass_factor
             
             # Limit acceleration to prevent explosions
             acc_magnitude = np.linalg.norm(acceleration)
-            max_acceleration = 1000.0  # Reasonable acceleration limit
+            max_acceleration = 800.0  # Increased acceleration limit to allow more movement
             if acc_magnitude > max_acceleration:
                 acceleration = acceleration * (max_acceleration / acc_magnitude)
             
@@ -522,29 +721,53 @@ class DeformableSporozoiteMesh:
             velocity = velocity * (1.0 - effective_damping_factor * dt) + acceleration * dt
             
             # Limit velocity for stability
-            max_velocity = 30.0 if spring_constant < 20.0 else 20.0  # Higher limit for flexible meshes but still controlled
+            max_velocity = 25.0 if spring_constant < 20.0 else 20.0  # Increased velocity limits
             velocity_magnitude = np.linalg.norm(velocity)
             if velocity_magnitude > max_velocity:
                 velocity = velocity * (max_velocity / velocity_magnitude)
             
-            # Update position
-            new_position = vertex + velocity * dt
+            # Calculate proposed new position
+            proposed_position = vertex + velocity * dt
             
-            # Keep vertices within reasonable distance from center
-            max_distance = self.length * (1.2 if spring_constant < 20.0 else 1.0)  # Allow some extra distance for flexible meshes
-            position_magnitude = np.linalg.norm(new_position - self.center_position)
+            # GENTLE vessel constraint: only apply if significantly outside vessel
+            if self._would_vertex_exit_vessel(proposed_position, buffer_factor=1.1):
+                # Only apply gentle correction if well outside vessel
+                vessel_center_2d = np.array([12.5, 7.5])  # Assuming domain center
+                vertex_2d = proposed_position[1:3]  # Y, Z coordinates
+                radial_direction = vertex_2d - vessel_center_2d
+                radial_distance = np.linalg.norm(radial_direction)
+                
+                if radial_distance > 1e-6:
+                    radial_unit = radial_direction / radial_distance
+                    # Only apply correction if significantly outside vessel
+                    max_radius = 5.5  # Increased allowed radius for gentler constraint
+                    if radial_distance > max_radius:
+                        # Apply gentle correction toward vessel center
+                        correction_strength = 0.1  # Very gentle correction
+                        correction_vector = -radial_unit * (radial_distance - max_radius) * correction_strength
+                        proposed_position[1:3] += correction_vector
+                        # Apply gentle velocity damping
+                        velocity_2d = velocity[1:3]
+                        radial_velocity = np.dot(velocity_2d, radial_unit)
+                        if radial_velocity > 0:  # Outward velocity
+                            velocity_2d -= radial_velocity * radial_unit * 0.2  # Gentle damping
+                            velocity[1:3] = velocity_2d
+            
+            # Keep vertices within reasonable distance from center (but allow more freedom)
+            max_distance = self.length * (1.3 if spring_constant < 20.0 else 1.1)  # Increased allowed distance
+            position_magnitude = np.linalg.norm(proposed_position - self.center_position)
             if position_magnitude > max_distance:
-                direction = (new_position - self.center_position) / position_magnitude
-                new_position = self.center_position + direction * max_distance
-                # Reduce velocity when constrained
-                velocity *= 0.7
+                direction = (proposed_position - self.center_position) / position_magnitude
+                proposed_position = self.center_position + direction * max_distance
+                # Gentle velocity reduction when constrained
+                velocity *= 0.8  # Gentler velocity reduction
             
-            self.vertices[i] = new_position
+            self.vertices[i] = proposed_position
             self.vertex_velocities[i] = velocity
         
-        # For very flexible meshes, allow slight center adjustment to follow deformation
-        if spring_constant < 15.0:  # Only for very flexible meshes
-            # Calculate actual center of vertices (excluding end caps if they exist)
+        # Allow center drift for all simulations to maintain mesh coherence
+        if spring_constant < 15.0:
+            # Allow center drift to follow deformation for mesh stability
             vertex_count = len(self.vertices)
             if vertex_count > 10:  # If we have end caps, exclude them
                 actual_center = np.mean(self.vertices[:-2], axis=0)
@@ -553,13 +776,25 @@ class DeformableSporozoiteMesh:
             
             center_drift = actual_center - self.center_position
             
-            # Allow small center drift to follow deformation, but limit it
-            max_drift = self.length * 0.05  # Very small drift allowed
+            # Allow reasonable center drift to maintain mesh coherence
+            max_drift = self.length * 0.05  # Slightly increased drift allowance
             drift_magnitude = np.linalg.norm(center_drift)
             if drift_magnitude > max_drift:
                 center_drift = center_drift * (max_drift / drift_magnitude)
             
-            self.center_position += center_drift * 0.05  # Very gradual center adjustment
+            self.center_position += center_drift * 0.03  # Gentle center adjustment
+    
+    def _would_vertex_exit_vessel(self, position: np.ndarray, buffer_factor: float = 1.0) -> bool:
+        """Check if a vertex position would be outside the blood vessel with adjustable buffer"""
+        # Assume vessel is centered in domain - adjust these if vessel geometry is different
+        vessel_center_y = 12.5  # Half of 25.0 μm domain height
+        vessel_center_z = 7.5   # Half of 15.0 μm domain depth
+        vessel_radius = 5.5 * buffer_factor  # Adjustable radius based on buffer factor
+        
+        # Calculate radial distance from vessel centerline (in Y-Z plane)
+        radial_distance = np.sqrt((position[1] - vessel_center_y)**2 + (position[2] - vessel_center_z)**2)
+        
+        return radial_distance > vessel_radius
     
     def to_vtk_polydata(self) -> vtk.vtkPolyData:
         """Convert mesh to VTK PolyData for visualization"""

@@ -44,7 +44,7 @@ class ImplicitBloodFlowField:
         self.hematocrit = hematocrit
         
         # Grid resolution for field sampling
-        self.grid_resolution = (60, 30, 20)  # Higher resolution in flow direction (x)
+        self.grid_resolution = (120, 50, 50)  # Much higher resolution in flow direction (x) for longer channel
         
         # Flow fields
         self.velocity_field = None
@@ -251,7 +251,11 @@ class ImplicitBloodFlowField:
         )
     
     def get_velocity_at_point(self, point: np.ndarray) -> np.ndarray:
-        """Get velocity vector at a specific point with periodic boundary handling"""
+        """Get velocity vector at a specific point with vessel boundary checking"""
+        # First check if point is inside vessel - if not, return zero velocity
+        if not self.is_point_in_vessel(point):
+            return np.zeros(3)
+        
         # Apply periodic boundary conditions for sampling
         sampling_point = point.copy()
         if self.periodic_x:
@@ -271,7 +275,11 @@ class ImplicitBloodFlowField:
         return velocity_vector
     
     def get_pressure_at_point(self, point: np.ndarray) -> float:
-        """Get pressure at a specific point"""
+        """Get pressure at a specific point with vessel boundary checking"""
+        # Return zero pressure outside vessel
+        if not self.is_point_in_vessel(point):
+            return 0.0
+            
         sampling_point = point.copy()
         if self.periodic_x:
             sampling_point[0] = sampling_point[0] % self.domain_size[0]
@@ -284,7 +292,11 @@ class ImplicitBloodFlowField:
         return self.pressure_interpolator(sampling_point)[()]
     
     def get_shear_rate_at_point(self, point: np.ndarray) -> float:
-        """Get shear rate at a specific point"""
+        """Get shear rate at a specific point with vessel boundary checking"""
+        # Return zero shear rate outside vessel
+        if not self.is_point_in_vessel(point):
+            return 0.0
+            
         sampling_point = point.copy()
         if self.periodic_x:
             sampling_point[0] = sampling_point[0] % self.domain_size[0]

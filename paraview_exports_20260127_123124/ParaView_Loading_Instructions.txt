@@ -1,0 +1,45 @@
+ParaView Loading Instructions for Sporozoite Data
+==================================================
+
+Generated on: 2026-01-27 12:31:24
+
+EXPORTED FILES:
+1. example_20260127_123124_vertices.vtp
+2. example_20260127_123124_vertices.vtp
+3. example_20260127_123124_vertices.vtp
+4. example_20260127_123124_mesh.vtp
+5. example_20260127_123124_mesh.vtp
+6. example_20260127_123124_mesh.vtp
+7. example_20260127_123124_all_vertices.vtp
+8. example_20260127_123124_meshes.vtm
+
+LOADING INSTRUCTIONS:
+1. Open ParaView
+2. File -> Open -> Navigate to this directory
+3. Select the desired .vtp or .vtm file
+4. Click 'Apply' in the Properties panel
+
+VISUALIZATION TIPS:
+- For vertex point clouds (.vtp files):
+  * Change representation to 'Points' or 'Point Gaussian'
+  * Adjust point size in Display Properties
+  * Color by 'Viability', 'SporozoiteID', or 'DistanceFromCenter'
+
+- For mesh files:
+  * Use 'Surface' or 'Surface With Edges' representation
+  * Color by available data arrays
+  * Apply transparency for better visualization
+
+- For multi-block datasets (.vtm files):
+  * Each sporozoite appears as a separate block
+  * You can show/hide individual sporozoites
+  * Use the MultiBlock Inspector for block management
+
+DATA ARRAYS AVAILABLE:
+- SporozoiteID: Unique identifier for each sporozoite
+- VertexIndex: Index of vertex within sporozoite mesh
+- Viability: Health/viability of sporozoite (0-1)
+- Motility: Movement capability (0-1)
+- DistanceFromCenter: Distance from sporozoite center
+- VelocityMagnitude: Speed of vertex motion (if available)
+
