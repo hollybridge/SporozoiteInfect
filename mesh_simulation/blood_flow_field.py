@@ -24,7 +24,7 @@ class ImplicitBloodFlowField:
     """
     
     def __init__(self, 
-                 domain_size: Tuple[float, float, float] = (100.0, 100.0, 50.0),
+                 domain_size: Tuple[float, float, float] = (150.0, 100.0, 100.0),
                  flow_type: FlowType = FlowType.LAMINAR,
                  inlet_velocity: float = 50.0,  # micrometers/second
                  vessel_diameter: float = 20.0,  # micrometers
@@ -124,9 +124,9 @@ class ImplicitBloodFlowField:
                         if r > 0:
                             self.shear_rate_field[i, j, k] = self.inlet_velocity / (self.vessel_diameter / 2)
                         
-                        # Pressure drops linearly along vessel
+                        # Pressure drops linearly along vessel ((self.domain_size[0] - X[i, j, k] represents the distance from the current point to the inlet of the vessel)
                         pressure_gradient = 8 * self.viscosity * self.inlet_velocity / (self.vessel_diameter / 2)**2
-                        self.pressure_field[i, j, k] = pressure_gradient * (self.domain_size[0] - X[i, j, k])
+                        self.pressure_field[i, j, k] = pressure_gradient * (self.domain_size[0] - X[i, j, k]) 
     
     def _generate_laminar_flow(self, X, Y, Z):
         """Generate laminar flow with parabolic velocity profile (Poiseuille flow)"""
@@ -356,7 +356,7 @@ class ImplicitBloodFlowField:
                 np.all(point[1:] <= self.domain_origin[1:] + self.domain_size[1:]))
     
     def apply_flow_forces(self, sporozoite_position: np.ndarray, sporozoite_velocity: np.ndarray) -> np.ndarray:
-        """Calculate forces on sporozoite due to blood flow"""
+        """Calculate forces on sporozoite due to blood flow - VELOCITY-ADAPTIVE SCALING"""
         if not self.is_point_in_vessel(sporozoite_position):
             return np.zeros(3)
         
@@ -364,13 +364,31 @@ class ImplicitBloodFlowField:
         flow_velocity = self.get_velocity_at_point(sporozoite_position)
         shear_rate = self.get_shear_rate_at_point(sporozoite_position)
         
-        # Drag force (Stokes drag for small particles)
-        relative_velocity = flow_velocity - sporozoite_velocity
-        drag_coefficient = 6 * np.pi * self.viscosity * 0.5  # Assuming 1 μm radius sporozoite
-        drag_force = drag_coefficient * relative_velocity
+        # VELOCITY-ADAPTIVE SCALING to prevent force explosion at high velocities
+        flow_speed = np.linalg.norm(flow_velocity)
         
-        # Shear-induced migration (Segre-Silberberg effect)
-        # Particles migrate away from vessel walls in shear flow
+        # Calculate adaptive scaling factor based on flow velocity
+        if flow_speed <= 1.0:
+            # Low velocity: minimal scaling
+            velocity_scale_factor = 0.01
+        elif flow_speed <= 5.0:
+            # Medium velocity: moderate scaling (logarithmic reduction)
+            velocity_scale_factor = 0.01 / (1 + np.log10(flow_speed))
+        else:
+            # High velocity: strong scaling (inverse scaling)
+            velocity_scale_factor = 0.01 / (flow_speed * 0.5)
+        
+        # Drag force (Stokes drag for small particles) - ADAPTIVE SCALING
+        relative_velocity = flow_velocity - sporozoite_velocity
+        
+        # Base drag coefficient (already reduced from original)
+        base_drag_coefficient = 6 * np.pi * self.viscosity * 0.5 * 0.01
+        
+        # Apply velocity-adaptive scaling
+        adaptive_drag_coefficient = base_drag_coefficient * velocity_scale_factor
+        drag_force = adaptive_drag_coefficient * relative_velocity
+        
+        # Shear-induced migration (Segre-Silberberg effect) - ADAPTIVE SCALING
         y_center = self.domain_size[1] / 2
         z_center = self.domain_size[2] / 2
         
@@ -382,13 +400,33 @@ class ImplicitBloodFlowField:
         if radial_distance > 1e-6:
             radial_direction[1:] = radial_direction[1:] / radial_distance
             
-            # Migration force proportional to shear rate and distance from center
-            migration_strength = shear_rate * radial_distance * 0.001
-            migration_force = radial_direction * migration_strength
+            # Migration force with velocity-adaptive scaling
+            base_migration_strength = shear_rate * radial_distance * 0.0001
+            adaptive_migration_strength = base_migration_strength * velocity_scale_factor
+            migration_force = radial_direction * adaptive_migration_strength
         else:
             migration_force = np.zeros(3)
         
-        total_force = drag_force + migration_force
+        # Total force with additional velocity-based capping
+        total_force = (drag_force + migration_force)
+        
+        # Cap maximum total force based on velocity to prevent instability
+        force_magnitude = np.linalg.norm(total_force)
+        if flow_speed <= 1.0:
+            max_force_limit = 5.0  # Low velocity limit
+        elif flow_speed <= 5.0:
+            max_force_limit = 10.0 / flow_speed  # Decreasing limit for medium velocity
+        else:
+            max_force_limit = 2.0 / flow_speed  # Strong limit for high velocity
+        
+        if force_magnitude > max_force_limit:
+            total_force = total_force * (max_force_limit / force_magnitude)
+        
+        # Debug output for high velocities
+        if flow_speed > 2.0:
+            print(f"    HIGH VELOCITY DEBUG - Flow speed: {flow_speed:.2f}, Scale factor: {velocity_scale_factor:.6f}")
+            print(f"      Original force mag: {force_magnitude:.2f}, Capped force mag: {np.linalg.norm(total_force):.2f}")
+        
         return total_force
     
     def get_field_visualization_data(self) -> Dict:

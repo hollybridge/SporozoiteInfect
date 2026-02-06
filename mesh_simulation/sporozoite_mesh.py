@@ -81,12 +81,15 @@ class DeformableSporozoiteMesh:
         
         for t in t_values:
             # Curved spine with natural sporozoite curvature
-            x = t * self.length - self.length/2
-            y = np.sin(t * np.pi) * self.length * 0.1  # natural curve
+            x = t * self.length - self.length/2 # center at origin otherwise 0 to 1 [t]
+            y = np.sin(t * np.pi) * self.length * 0.1  # natural curve and scale with length
             z = 0
             spine_points.append([x, y, z])
         
         spine_points = np.array(spine_points)
+        
+        # Store spine points for LJ potential calculations
+        self.original_spine_points = spine_points.copy()  # Relative to center
         
         # Create cross-sections perpendicular to spine - FIXED VERSION
         for i, spine_point in enumerate(spine_points):
@@ -188,18 +191,6 @@ class DeformableSporozoiteMesh:
         self.faces = np.array(faces)
         self.original_vertices = self.vertices.copy()  # rest state
         
-        # DEBUG: Print mesh creation info
-        '''
-        print(f"MESH CREATION DEBUG for sporozoite {self.id}:")
-        print(f"  Created {len(vertices)} vertices, {len(faces)} faces")
-        print(f"  Vertex range X: [{np.min(vertices[:, 0]):.3f}, {np.max(vertices[:, 0]):.3f}]")
-        print(f"  Vertex range Y: [{np.min(vertices[:, 1]):.3f}, {np.max(vertices[:, 1]):.3f}]")
-        print(f"  Vertex range Z: [{np.min(vertices[:, 2]):.3f}, {np.max(vertices[:, 2]):.3f}]")
-        print(f"  First 3 vertices:")
-        for i in range(min(3, len(vertices))):
-            print(f"    Vertex {i}: {vertices[i]}")
-        '''
-        
         # Calculate vertex normals
         self._calculate_vertex_normals()
         
@@ -209,6 +200,42 @@ class DeformableSporozoiteMesh:
         # Initialize forces and velocity arrays
         self.forces = np.zeros_like(self.vertices)
         self.velocity = np.zeros_like(self.vertices)  # per-vertex velocities
+    
+    def get_current_centerline_points(self) -> np.ndarray:
+        """Get current centerline points in global coordinates"""
+        if hasattr(self, 'original_spine_points'):
+            # Transform original spine points to current position/orientation
+            current_spine = []
+            for point in self.original_spine_points:
+                # Apply current center position
+                global_point = self.center_position + point
+                current_spine.append(global_point)
+            return np.array(current_spine)
+        else:
+            # Fallback: return just the center position
+            return np.array([self.center_position])
+    
+    def get_centerline_segment_data(self) -> List[Dict]:
+        """Get centerline segments with radii for LJ potential calculations"""
+        centerline_points = self.get_current_centerline_points()
+        segments = []
+        
+        n_segments = len(centerline_points)
+        for i in range(n_segments):
+            # Calculate local radius (varies along length)
+            t = i / (n_segments - 1) if n_segments > 1 else 0
+            radius_factor = np.sin(np.pi * t) if t > 0 and t < 1 else 0.1
+            radius_factor = max(0.1, radius_factor)  # Minimum radius
+            local_radius = self.diameter/2 * radius_factor
+            
+            segment_data = {
+                'position': centerline_points[i],
+                'radius': local_radius,
+                'segment_id': i
+            }
+            segments.append(segment_data)
+        
+        return segments
     
     def _calculate_vertex_normals(self):
         """Calculate vertex normals for the mesh"""
@@ -267,6 +294,94 @@ class DeformableSporozoiteMesh:
         
         self.rest_lengths = np.array(self.rest_lengths)
     
+    def calculate_volume(self) -> float:
+        """
+        Calculate the volume of the sporozoite mesh using the divergence theorem.
+        For a closed polyhedral mesh, volume = (1/3) * sum(face_area * dot(face_center, face_normal))
+        
+        Returns:
+            Volume in cubic micrometers (μm³)
+        """
+        total_volume = 0.0
+        
+        for face in self.faces:
+            if len(face) < 3:
+                continue
+                
+            # Get vertices of the face
+            face_vertices = [self.vertices[i] for i in face if i < len(self.vertices)]
+            
+            if len(face_vertices) < 3:
+                continue
+            
+            # Calculate face center
+            face_center = np.mean(face_vertices, axis=0)
+            
+            # Calculate face normal and area using cross product for triangular faces
+            if len(face_vertices) == 3:
+                # Triangle face
+                v0, v1, v2 = face_vertices
+                edge1 = v1 - v0
+                edge2 = v2 - v0
+                face_normal = np.cross(edge1, edge2)
+                face_area = 0.5 * np.linalg.norm(face_normal)
+                
+                # Normalize normal
+                if face_area > 1e-12:
+                    face_normal = face_normal / (2.0 * face_area)  # Already divided by 2 for triangle
+                else:
+                    continue
+                    
+            elif len(face_vertices) >= 4:
+                # Polygon face - triangulate and sum
+                face_area = 0.0
+                face_normal = np.zeros(3)
+                
+                # Use fan triangulation from first vertex
+                v0 = face_vertices[0]
+                for i in range(1, len(face_vertices) - 1):
+                    v1 = face_vertices[i]
+                    v2 = face_vertices[i + 1]
+                    
+                    edge1 = v1 - v0
+                    edge2 = v2 - v0
+                    triangle_normal = np.cross(edge1, edge2)
+                    triangle_area = 0.5 * np.linalg.norm(triangle_normal)
+                    
+                    face_area += triangle_area
+                    face_normal += triangle_normal
+                
+                # Normalize total normal
+                if face_area > 1e-12:
+                    face_normal = face_normal / (2.0 * face_area)
+                else:
+                    continue
+            
+            # Apply divergence theorem: V += (1/3) * face_area * dot(face_center, face_normal)
+            contribution = (1.0/3.0) * face_area * np.dot(face_center, face_normal)
+            total_volume += contribution
+        
+        # Ensure positive volume (normal orientation might be reversed)
+        total_volume = abs(total_volume)
+        
+        return total_volume
+    
+    def get_approximate_volume(self) -> float:
+        """
+        Calculate approximate volume using prolate spheroid formula as fallback.
+        V = (4/3) * π * a * b² where a = length/2, b = diameter/2
+        
+        Returns:
+            Approximate volume in cubic micrometers (μm³)
+        """
+        a = self.length / 2.0  # Semi-major axis
+        b = self.diameter / 2.0  # Semi-minor axis
+        
+        # Prolate spheroid volume formula
+        volume = (4.0/3.0) * np.pi * a * b * b
+        
+        return volume
+    
     def calculate_peclet_number(self, flow_velocity: np.ndarray) -> float:
         """Calculate Péclet number: Pe = UL/D where U=flow speed, L=characteristic length, D=diffusivity"""
         flow_speed = np.linalg.norm(flow_velocity)
@@ -324,24 +439,22 @@ class DeformableSporozoiteMesh:
         self.flow_induced_flexibility = total_flow_flexibility
         return total_flow_flexibility
     
-    def get_effective_spring_constant(self) -> float:
-        """Calculate effective spring constant based on activity and flow coupling"""
-        # Base spring constant modified by both activity and flow effects
-        activity_factor = 1.0 - self.activity_induced_flexibility  # Reduces stiffness
-        flow_factor = 1.0 - self.flow_induced_flexibility          # Reduces stiffness
+    def get_effective_spring_constant(self):
+        """Calculate effective spring constant - EMERGENCY BOOST for blood flow"""
+        base_spring = self.config.SPRING_CONSTANT_BASE
         
-        # Combined effect: both activity and flow can make sporozoite more flexible
-        combined_flexibility = self.activity_induced_flexibility + self.flow_induced_flexibility
-        combined_flexibility = min(0.9, combined_flexibility)  # Cap at 90% flexibility increase
+        # For blood flow simulations: MASSIVELY increase spring constant to prevent collapse
+        if hasattr(self, 'in_blood_flow') and self.in_blood_flow:
+            # Use 10x stronger springs to resist flow-induced deformation
+            effective_spring = base_spring * 10.0
+        else:
+            # In tissue: use normal spring constant
+            effective_spring = base_spring
         
-        effective_stiffness_factor = 1.0 - combined_flexibility
-        effective_spring_constant = self.base_spring_constant * effective_stiffness_factor
+        # Apply viability and stiffness factors
+        effective_spring *= self.viability * self.stiffness
         
-        # Ensure minimum stiffness to prevent mesh collapse
-        min_spring_constant = self.base_spring_constant * 0.1
-        effective_spring_constant = max(min_spring_constant, effective_spring_constant)
-        
-        return effective_spring_constant
+        return effective_spring
     
     def update_activity_level(self, flow_velocity: np.ndarray):
         """Update sporozoite activity level based on flow conditions"""
@@ -424,7 +537,8 @@ class DeformableSporozoiteMesh:
                 shear_resistance = np.array([-shear_rate * 0.05, 0, 0])
                 
             self.tissue_resistance_force = shear_resistance
-                
+
+            '''    
             # DEBUG: Print Péclet physics
             if hasattr(self, '_debug_counter'):
                 self._debug_counter += 1
@@ -442,7 +556,7 @@ class DeformableSporozoiteMesh:
                 print(f"    Activity flexibility: {self.activity_induced_flexibility:.3f}")
                 print(f"    Flow flexibility: {self.flow_induced_flexibility:.3f}")
                 print(f"    Flow force: {self.tissue_flow_force} (mag: {flow_force_mag:.2f})")
-                
+            '''    
         else:
             # This is a tissue field - use original approach but with activity coupling
             self.flow_regime = "activity_dominated"  # No flow, so activity dominates
@@ -525,6 +639,247 @@ class DeformableSporozoiteMesh:
             undulation_force = (lateral_force + vertical_force) * self.config.UNDULATION_FORCE_SCALE
             self.forces[i] += undulation_force
 
+    def calculate_vertex_propulsion_forces(self, propulsion_magnitude: float) -> np.ndarray:
+        """
+        Calculate vertex-based propulsion forces where each vertex moves counterclockwise
+        along the sporozoite's curvature trajectory.
+        
+        Args:
+            propulsion_magnitude: Constant magnitude of propulsion force for all vertices
+            
+        Returns:
+            Array of propulsion forces for each vertex
+        """
+        vertex_propulsion_forces = np.zeros_like(self.vertices)
+        n_vertices = len(self.vertices)
+        
+        # Get the current centerline points for reference
+        centerline_points = self.get_current_centerline_points()
+        n_centerline = len(centerline_points)
+        
+        # Map vertices to centerline segments for propulsion direction calculation
+        n_segments = self.config.LONGITUDINAL_SEGMENTS
+        n_radial = self.config.RADIAL_SEGMENTS
+        
+        # Process vertices organized by longitudinal segments (rings)
+        for segment_idx in range(n_segments):
+            # Get vertices in this ring
+            ring_start = segment_idx * n_radial
+            ring_end = min(ring_start + n_radial, n_vertices - 2)  # Exclude end caps
+            
+            if ring_end <= ring_start:
+                continue
+                
+            # Calculate propulsion direction for this segment based on centerline curvature
+            propulsion_direction = self._get_segment_propulsion_direction(segment_idx, centerline_points)
+            
+            # Apply propulsion to all vertices in this ring
+            for vertex_idx in range(ring_start, ring_end):
+                if vertex_idx < n_vertices:
+                    vertex_propulsion_forces[vertex_idx] = propulsion_direction * propulsion_magnitude
+        
+        # Handle end cap vertices separately (head and tail nodes)
+        if n_vertices >= 2:
+            # Head node (first end cap): direction from 1st to 2nd centerline point
+            head_vertex_idx = n_vertices - 2  # Second to last vertex (head cap center)
+            if len(centerline_points) >= 2:
+                head_direction = self._normalize_vector(centerline_points[1] - centerline_points[0])
+                vertex_propulsion_forces[head_vertex_idx] = head_direction * propulsion_magnitude
+            
+            # Tail node (last end cap): direction from second-to-last to last centerline point  
+            tail_vertex_idx = n_vertices - 1  # Last vertex (tail cap center)
+            if len(centerline_points) >= 2:
+                tail_direction = self._normalize_vector(centerline_points[-1] - centerline_points[-2])
+                vertex_propulsion_forces[tail_vertex_idx] = tail_direction * propulsion_magnitude
+        
+        return vertex_propulsion_forces
+    
+    def _get_segment_propulsion_direction(self, segment_idx: int, centerline_points: np.ndarray) -> np.ndarray:
+        """
+        Calculate propulsion direction for a centerline segment based on adjacent segments.
+        
+        Args:
+            segment_idx: Index of the current segment
+            centerline_points: Array of centerline points
+            
+        Returns:
+            Normalized propulsion direction vector
+        """
+        n_points = len(centerline_points)
+        
+        if n_points < 2:
+            # Fallback: use sporozoite's overall direction
+            return np.array([np.cos(self.direction), np.sin(self.direction), 0])
+        
+        # For general case: ith node propelled in direction identified by (i-1)th and (i+1)th nodes
+        if segment_idx == 0:
+            # Head segment: direction from 1st to 2nd point
+            if n_points >= 2:
+                direction = centerline_points[1] - centerline_points[0]
+            else:
+                direction = np.array([1, 0, 0])  # Default forward direction
+        elif segment_idx == n_points - 1:
+            # Tail segment: direction from second-to-last to last point
+            if n_points >= 2:
+                direction = centerline_points[-1] - centerline_points[-2]
+            else:
+                direction = np.array([1, 0, 0])  # Default forward direction
+        else:
+            # General case: direction from (i-1) to (i+1)
+            if segment_idx - 1 >= 0 and segment_idx + 1 < n_points:
+                direction = centerline_points[segment_idx + 1] - centerline_points[segment_idx - 1]
+            else:
+                # Fallback for edge cases
+                direction = np.array([1, 0, 0])
+        
+        # Add counterclockwise rotation component based on sporozoite curvature
+        direction = self._apply_counterclockwise_curvature(direction, segment_idx, centerline_points)
+        
+        return self._normalize_vector(direction)
+    
+    def _apply_counterclockwise_curvature(self, base_direction: np.ndarray, segment_idx: int, 
+                                         centerline_points: np.ndarray) -> np.ndarray:
+        """
+        Apply counterclockwise curvature to the base propulsion direction.
+        
+        Args:
+            base_direction: Base propulsion direction
+            segment_idx: Current segment index
+            centerline_points: Array of centerline points
+            
+        Returns:
+            Direction vector with counterclockwise curvature applied
+        """
+        n_points = len(centerline_points)
+        
+        if n_points < 3 or segment_idx < 1 or segment_idx >= n_points - 1:
+            # Not enough points to calculate curvature, return base direction
+            return base_direction
+        
+        # Calculate local curvature using three consecutive points
+        p_prev = centerline_points[segment_idx - 1]
+        p_curr = centerline_points[segment_idx]
+        p_next = centerline_points[segment_idx + 1]
+        
+        # Vectors between consecutive points
+        v1 = p_curr - p_prev
+        v2 = p_next - p_curr
+        
+        # Calculate curvature vector (points toward center of curvature)
+        v1_norm = self._normalize_vector(v1)
+        v2_norm = self._normalize_vector(v2)
+        
+        # Curvature direction (perpendicular to average tangent)
+        tangent_avg = self._normalize_vector(v1_norm + v2_norm)
+        
+        # Calculate perpendicular vector for counterclockwise motion
+        # Use cross product to get perpendicular in the plane
+        if np.linalg.norm(tangent_avg) > 1e-6:
+            # Create perpendicular vector in XY plane (counterclockwise)
+            perp_vector = np.array([-tangent_avg[1], tangent_avg[0], 0])
+            
+            # Scale by curvature magnitude and motility
+            curvature_magnitude = self._calculate_local_curvature(p_prev, p_curr, p_next)
+            curvature_strength = 0.3 * self.motility  # Adjust this factor as needed
+            
+            # Blend base direction with curvature component
+            curved_direction = base_direction + perp_vector * curvature_magnitude * curvature_strength
+            
+            return curved_direction
+        else:
+            return base_direction
+    
+    def _calculate_local_curvature(self, p_prev: np.ndarray, p_curr: np.ndarray, p_next: np.ndarray) -> float:
+        """
+        Calculate local curvature magnitude at a point using three consecutive points.
+        
+        Args:
+            p_prev: Previous point
+            p_curr: Current point  
+            p_next: Next point
+            
+        Returns:
+            Curvature magnitude (1/radius)
+        """
+        # Vectors between consecutive points
+        v1 = p_curr - p_prev
+        v2 = p_next - p_curr
+        
+        v1_length = np.linalg.norm(v1)
+        v2_length = np.linalg.norm(v2)
+        
+        if v1_length < 1e-8 or v2_length < 1e-8:
+            return 0.0
+        
+        # Normalize vectors
+        v1_norm = v1 / v1_length
+        v2_norm = v2 / v2_length
+        
+        # Calculate angle between vectors
+        dot_product = np.clip(np.dot(v1_norm, v2_norm), -1.0, 1.0)
+        angle = np.arccos(dot_product)
+        
+        # Curvature = angle / average_segment_length
+        avg_length = (v1_length + v2_length) / 2.0
+        if avg_length > 1e-8:
+            curvature = angle / avg_length
+        else:
+            curvature = 0.0
+        
+        return curvature
+    
+    def _normalize_vector(self, vector: np.ndarray) -> np.ndarray:
+        """
+        Normalize a vector, handling zero vectors gracefully.
+        
+        Args:
+            vector: Input vector
+            
+        Returns:
+            Normalized vector or default direction if input is zero
+        """
+        magnitude = np.linalg.norm(vector)
+        if magnitude > 1e-8:
+            return vector / magnitude
+        else:
+            # Return default forward direction for zero vectors
+            return np.array([1, 0, 0])
+    
+    def apply_vertex_propulsion(self, propulsion_strength: float, dt: float):
+        """
+        Apply vertex-based propulsion forces to the sporozoite mesh.
+        
+        Args:
+            propulsion_strength: Overall strength of propulsion
+            dt: Time step
+        """
+        # Calculate propulsion forces for each vertex
+        vertex_propulsion_forces = self.calculate_vertex_propulsion_forces(propulsion_strength)
+        
+        # Apply forces to vertex velocities if they exist
+        if hasattr(self, 'vertex_velocities') and len(self.vertex_velocities) == len(self.vertices):
+            for i, force in enumerate(vertex_propulsion_forces):
+                if i < len(self.vertex_velocities):
+                    # Apply propulsion as acceleration
+                    acceleration = force * dt / max(0.01, self.motility)  # Scale by motility
+                    self.vertex_velocities[i] += acceleration
+        else:
+            # Initialize vertex velocities if they don't exist
+            self.vertex_velocities = [np.zeros(3) for _ in range(len(self.vertices))]
+            for i, force in enumerate(vertex_propulsion_forces):
+                acceleration = force * dt / max(0.01, self.motility)
+                self.vertex_velocities[i] = acceleration
+        
+        # Also update center position based on average vertex motion
+        if len(vertex_propulsion_forces) > 0:
+            avg_propulsion = np.mean(vertex_propulsion_forces, axis=0)
+            center_acceleration = avg_propulsion * dt * self.motility
+            
+            # Update center velocity
+            if not hasattr(self, 'center_velocity'):
+                self.center_velocity = np.zeros(3)
+            self.center_velocity += center_acceleration
+
     def update_motion(self, dt, forces, spring_constant=100.0, damping=0.5):
         """
         Update sporozoite motion with enhanced deformation capability.
@@ -553,237 +908,190 @@ class DeformableSporozoiteMesh:
             self._update_physics_substep_deformable(substep_dt, forces, effective_spring, effective_damping)
     
     def _update_physics_substep_deformable(self, dt, forces, spring_constant, damping):
-        """Enhanced physics substep with gentle vessel-aware constraints."""
+        """FIXED physics substep with GENTLE force limits and proper mesh preservation"""
         
-        # Initialize velocities if not present
+        # DEBUG: Track this specific issue
+        if not hasattr(self, '_flatten_debug_counter'):
+            self._flatten_debug_counter = 0
+        self._flatten_debug_counter += 1
+        
+        # Check mesh integrity BEFORE physics update
+        bounds = self.get_bounding_box()
+        dimensions = bounds[1] - bounds[0]
+        
+        # Define LENIENT thresholds for mesh collapse (less strict)
+        min_length_threshold = self.length * 0.2   # Must maintain at least 20% of original length
+        min_diameter_threshold = self.diameter * 0.15  # Must maintain at least 15% of original diameter
+        
+        # Check for critical deformation
+        is_critically_deformed = (
+            dimensions[0] < min_length_threshold or
+            dimensions[1] < min_diameter_threshold or
+            dimensions[2] < min_diameter_threshold or
+            np.any(dimensions < 0.02)  # Any dimension below 0.02 μm
+        )
+        
+        if is_critically_deformed:
+            print(f"      MESH EMERGENCY: Sporozoite {self.id} critically deformed!")
+            print(f"        Dimensions: {dimensions}")
+            print(f"        Thresholds - L: {min_length_threshold:.2f}, D: {min_diameter_threshold:.2f}")
+            
+            # COMPLETE restoration from original positions
+            if hasattr(self, 'original_relative_positions'):
+                for i, orig_rel_pos in enumerate(self.original_relative_positions):
+                    if i < len(self.vertices):
+                        self.vertices[i] = self.center_position + orig_rel_pos
+                
+                # Clear all velocities
+                if hasattr(self, 'vertex_velocities'):
+                    for i in range(len(self.vertex_velocities)):
+                        self.vertex_velocities[i] = np.zeros(3)
+                
+                print(f"        EMERGENCY RESTORATION COMPLETE")
+                return  # Skip physics update to prevent re-collapse
+        
+        # Initialize velocities if needed
         if not hasattr(self, 'vertex_velocities'):
             self.vertex_velocities = [np.zeros(3) for _ in range(len(self.vertices))]
         
-        # Calculate center position and movement
+        # GENTLE center motion with LIMITED force scaling
         old_center = self.center_position.copy()
-        
-        # Apply external forces to center
         center_force = np.zeros(3)
+        
+        # Apply external forces with GENTLE scaling
         if 'directional' in forces:
-            center_force += forces['directional']
+            center_force += forces['directional'] * 0.8  # Only 20% reduction
         if 'random' in forces:
-            center_force += forces['random']
+            center_force += forces['random'] * 0.9  # Only 10% reduction
         if 'boundary_repulsion' in forces:
-            center_force += forces['boundary_repulsion']
+            center_force += forces['boundary_repulsion'] * 0.5
         
-        # Add blood flow forces if available
+        # Add flow forces with MODERATE limits
         if hasattr(self, 'tissue_flow_force'):
-            center_force += self.tissue_flow_force
+            flow_force_magnitude = np.linalg.norm(self.tissue_flow_force)
+            max_flow_force = 25.0  # Increased limit (was 15.0)
+            if flow_force_magnitude > max_flow_force:
+                scaled_flow_force = self.tissue_flow_force * (max_flow_force / flow_force_magnitude)
+            else:
+                scaled_flow_force = self.tissue_flow_force
+            center_force += scaled_flow_force * 0.6  # Increased flow influence (was 0.4)
+            
         if hasattr(self, 'tissue_resistance_force'):
-            center_force += self.tissue_resistance_force
+            center_force += self.tissue_resistance_force * 0.2
         
-        # Update center position with damping
-        center_acceleration = center_force * self.motility
+        # GENTLE center acceleration and movement
+        center_acceleration = center_force * self.motility * 1.0  # Normal acceleration
+        
+        # Apply MODERATE damping (not extreme)
         center_velocity = getattr(self, 'center_velocity', np.zeros(3))
-        center_velocity = center_velocity * (1.0 - damping * dt * 0.5) + center_acceleration * dt
+        center_velocity = center_velocity * (1.0 - damping * 3.0 * dt) + center_acceleration * dt
+        
+        # REASONABLE velocity limits (allow good movement)
+        max_center_velocity = 20.0  # Increased from 15.0
+        center_vel_magnitude = np.linalg.norm(center_velocity)
+        if center_vel_magnitude > max_center_velocity:
+            center_velocity = center_velocity * (max_center_velocity / center_vel_magnitude)
+        
+        # Update center position
         self.center_position += center_velocity * dt
         self.center_velocity = center_velocity
+        center_move = self.center_position - old_center
         
-        # Calculate forces on each vertex with GENTLE vessel awareness
+        # GENTLE VERTEX PHYSICS with LIMITED spring forces
         vertex_forces = []
+        max_spring_force = 0.0
+        
+        # Use MODERATE restoring forces (not extreme)
+        if is_critically_deformed:
+            # Emergency: Strong but not extreme springs
+            emergency_spring_constant = spring_constant * 8.0  # Reduced from 20x
+        else:
+            # Normal: Gentle springs for shape maintenance
+            emergency_spring_constant = spring_constant * 2.0  # Much gentler (was 5x)
+        
+        # Calculate GENTLE restoring forces
         for i, vertex in enumerate(self.vertices):
             force = np.zeros(3)
             
-            # CONTROLLED restoring force to original shape
+            # Gentle restoring force to original shape
             if i < len(self.original_relative_positions):
                 target_position = self.center_position + self.original_relative_positions[i]
                 displacement = target_position - vertex
                 
-                # Make restoring force proportional to displacement but not too weak
-                distance_from_rest = np.linalg.norm(displacement)
+                # LIMIT spring force magnitude to prevent explosion
+                spring_force = displacement * emergency_spring_constant
+                spring_force_mag = np.linalg.norm(spring_force)
                 
-                # Gradual increase in restoring force based on distance
-                if distance_from_rest > self.length * 0.4:  
-                    # Strong restoration when very deformed (beyond 40% of length)
-                    spring_force = displacement * spring_constant * 5.0
-                elif distance_from_rest > self.length * 0.2:  
-                    # Moderate restoration for significant deformation (20-40% of length)
-                    spring_force = displacement * spring_constant * 1.0
-                else:
-                    # Weak restoration for small deformation (< 20% of length)
-                    spring_force = displacement * spring_constant * 0.3
+                # CRITICAL: Cap maximum spring force per vertex
+                max_allowed_spring_force = 50.0  # Much lower limit (was unlimited)
+                if spring_force_mag > max_allowed_spring_force:
+                    spring_force = spring_force * (max_allowed_spring_force / spring_force_mag)
                 
-                # For very flexible meshes, reduce all restoring forces but don't eliminate them
-                if spring_constant < 20.0:
-                    spring_force *= 0.5  # Reduce but don't eliminate
-                
+                max_spring_force = max(max_spring_force, np.linalg.norm(spring_force))
                 force += spring_force
-            
-            # GENTLE vessel-aware undulation forces
-            if 'undulation' in forces and i < len(forces['undulation']):
-                undulation_force = forces['undulation'][i]
-                
-                # Scale undulation force based on spring constant but limit maximum
-                if spring_constant < 20.0:
-                    undulation_scale = min(2.0, 50.0 / max(1.0, spring_constant))  # Cap at 2x scale
-                else:
-                    undulation_scale = 0.5
-                
-                undulation_force *= undulation_scale
-                
-                # GENTLE vessel constraint: only reduce outward forces if getting close to boundary
-                proposed_position = vertex + undulation_force * dt * dt  # Rough estimate
-                if self._would_vertex_exit_vessel(proposed_position):
-                    # Only apply gentle reduction, don't eliminate forces completely
-                    vessel_center_2d = np.array([12.5, 7.5])  # Assuming domain center
-                    vertex_2d = proposed_position[1:3]  # Y, Z coordinates
-                    radial_direction = vertex_2d - vessel_center_2d
-                    radial_distance = np.linalg.norm(radial_direction)
-                    
-                    if radial_distance > 1e-6:
-                        radial_unit = radial_direction / radial_distance
-                        # Project undulation force and gently reduce radial component
-                        force_2d = undulation_force[1:3]  # Y, Z components
-                        radial_component = np.dot(force_2d, radial_unit)
-                        if radial_component > 0:  # Outward force
-                            # Gently reduce outward radial component instead of eliminating it
-                            reduction_factor = 0.5  # Reduce by 50% instead of 100%
-                            force_2d -= radial_component * radial_unit * reduction_factor
-                            undulation_force[1:3] = force_2d
-                
-                # Limit undulation force magnitude to prevent instability
-                force_magnitude = np.linalg.norm(undulation_force)
-                max_undulation_force = self.length * 2.0  # Increased limit to allow more movement
-                if force_magnitude > max_undulation_force:
-                    undulation_force = undulation_force * (max_undulation_force / force_magnitude)
-                
-                force += undulation_force
             
             vertex_forces.append(force)
         
-        # Apply neighbor-based spring forces for shape coherence with better control
-        if hasattr(self, 'edge_list') and hasattr(self, 'rest_lengths'):
-            for edge_idx, (v1, v2) in enumerate(self.edge_list):
-                if edge_idx < len(self.rest_lengths) and v1 < len(vertex_forces) and v2 < len(vertex_forces):
-                    current_vec = self.vertices[v2] - self.vertices[v1]
-                    current_length = np.linalg.norm(current_vec)
-                    
-                    if current_length > 1e-8:
-                        rest_length = self.rest_lengths[edge_idx]
-                        
-                        # Allow reasonable deformation but prevent extreme distortion
-                        if spring_constant < 20.0:
-                            # Flexible: allow 25% extension/compression (more than before)
-                            max_extension = rest_length * 1.25
-                            max_compression = rest_length * 0.75
-                        else:
-                            # Normal: allow 15% extension/compression
-                            max_extension = rest_length * 1.15
-                            max_compression = rest_length * 0.85
-                        
-                        # Calculate force based on deformation level
-                        if current_length > max_extension:
-                            excess = current_length - max_extension
-                            force_magnitude = spring_constant * excess * 2.0  # Reduced force strength
-                        elif current_length < max_compression:
-                            excess = max_compression - current_length
-                            force_magnitude = spring_constant * excess * 2.0  # Reduced force strength
-                        else:
-                            # Within allowed range: gentle forces to maintain shape
-                            extension = current_length - rest_length
-                            force_magnitude = spring_constant * extension * 0.1  # Very gentle internal forces
-                        
-                        # Limit maximum edge force to prevent instability
-                        max_edge_force = spring_constant * rest_length * 0.5  # Same limit
-                        if abs(force_magnitude) > max_edge_force:
-                            force_magnitude = max_edge_force * (1 if force_magnitude > 0 else -1)
-                        
-                        force_direction = current_vec / current_length
-                        edge_force = force_magnitude * force_direction
-                        
-                        # Distribute force to vertices
-                        vertex_forces[v1] += edge_force * 0.5
-                        vertex_forces[v2] -= edge_force * 0.5
-        
-        # Update vertex positions with GENTLE vessel awareness
+        # Apply GENTLE vertex updates
         for i, (vertex, force) in enumerate(zip(self.vertices, vertex_forces)):
             if i >= len(self.vertex_velocities):
                 continue
-                
-            # Apply force with controlled responsiveness
-            mass_factor = 0.8 if spring_constant < 20.0 else 1.0
-            acceleration = force * mass_factor
             
-            # Limit acceleration to prevent explosions
+            # GENTLE responsiveness to prevent oscillations
+            responsiveness = 0.05  # Moderate responsiveness (was 0.1)
+            acceleration = force * responsiveness
+            
+            # MODERATE acceleration limits
             acc_magnitude = np.linalg.norm(acceleration)
-            max_acceleration = 800.0  # Increased acceleration limit to allow more movement
+            max_acceleration = 20.0  # Reasonable limit
             if acc_magnitude > max_acceleration:
                 acceleration = acceleration * (max_acceleration / acc_magnitude)
             
-            # Update velocity with controlled damping
+            # Update velocity with GENTLE damping
             velocity = self.vertex_velocities[i]
-            effective_damping_factor = damping * (0.8 if spring_constant < 20.0 else 1.0)
-            velocity = velocity * (1.0 - effective_damping_factor * dt) + acceleration * dt
+            damping_factor = damping * 8.0  # Moderate damping (not extreme)
+            velocity = velocity * (1.0 - damping_factor * dt) + acceleration * dt
             
-            # Limit velocity for stability
-            max_velocity = 25.0 if spring_constant < 20.0 else 20.0  # Increased velocity limits
+            # GENTLE velocity limits
+            max_velocity = 8.0  # Reasonable velocity limit
             velocity_magnitude = np.linalg.norm(velocity)
             if velocity_magnitude > max_velocity:
                 velocity = velocity * (max_velocity / velocity_magnitude)
             
-            # Calculate proposed new position
-            proposed_position = vertex + velocity * dt
+            # Update position with CONTROLLED deviation limits
+            new_position = vertex + velocity * dt
             
-            # GENTLE vessel constraint: only apply if significantly outside vessel
-            if self._would_vertex_exit_vessel(proposed_position, buffer_factor=1.1):
-                # Only apply gentle correction if well outside vessel
-                vessel_center_2d = np.array([12.5, 7.5])  # Assuming domain center
-                vertex_2d = proposed_position[1:3]  # Y, Z coordinates
-                radial_direction = vertex_2d - vessel_center_2d
-                radial_distance = np.linalg.norm(radial_direction)
-                
-                if radial_distance > 1e-6:
-                    radial_unit = radial_direction / radial_distance
-                    # Only apply correction if significantly outside vessel
-                    max_radius = 5.5  # Increased allowed radius for gentler constraint
-                    if radial_distance > max_radius:
-                        # Apply gentle correction toward vessel center
-                        correction_strength = 0.1  # Very gentle correction
-                        correction_vector = -radial_unit * (radial_distance - max_radius) * correction_strength
-                        proposed_position[1:3] += correction_vector
-                        # Apply gentle velocity damping
-                        velocity_2d = velocity[1:3]
-                        radial_velocity = np.dot(velocity_2d, radial_unit)
-                        if radial_velocity > 0:  # Outward velocity
-                            velocity_2d -= radial_velocity * radial_unit * 0.2  # Gentle damping
-                            velocity[1:3] = velocity_2d
+            # Keep vertices REASONABLY close to original positions
+            max_deviation = self.length * 0.15  # Increased from 0.1 to allow more deformation
+            relative_pos = new_position - self.center_position
+            if i < len(self.original_relative_positions):
+                deviation = relative_pos - self.original_relative_positions[i]
+                deviation_magnitude = np.linalg.norm(deviation)
+                if deviation_magnitude > max_deviation:
+                    # Clamp to maximum allowed deviation
+                    relative_pos = self.original_relative_positions[i] + deviation * (max_deviation / deviation_magnitude)
+                    new_position = self.center_position + relative_pos
+                    velocity *= 0.7  # Gentle damping when constrained
             
-            # Keep vertices within reasonable distance from center (but allow more freedom)
-            max_distance = self.length * (1.3 if spring_constant < 20.0 else 1.1)  # Increased allowed distance
-            position_magnitude = np.linalg.norm(proposed_position - self.center_position)
-            if position_magnitude > max_distance:
-                direction = (proposed_position - self.center_position) / position_magnitude
-                proposed_position = self.center_position + direction * max_distance
-                # Gentle velocity reduction when constrained
-                velocity *= 0.8  # Gentler velocity reduction
-            
-            self.vertices[i] = proposed_position
+            self.vertices[i] = new_position
             self.vertex_velocities[i] = velocity
         
-        # Allow center drift for all simulations to maintain mesh coherence
-        if spring_constant < 15.0:
-            # Allow center drift to follow deformation for mesh stability
-            vertex_count = len(self.vertices)
-            if vertex_count > 10:  # If we have end caps, exclude them
-                actual_center = np.mean(self.vertices[:-2], axis=0)
+        # Debug output for monitoring
+        if self._flatten_debug_counter <= 5 or is_critically_deformed:
+            post_bounds = self.get_bounding_box()
+            post_dims = post_bounds[1] - post_bounds[0]
+            center_movement_magnitude = np.linalg.norm(center_move)
+            print(f"      GENTLE PHYSICS - Post dims: {post_dims}")
+            print(f"      Max spring force: {max_spring_force:.2f} (limit: 50.0)")
+            print(f"      Center movement: {center_movement_magnitude:.6f} μm")
+            
+            if is_critically_deformed:
+                restored = np.all(post_dims > [min_length_threshold*0.8, min_diameter_threshold*0.8, min_diameter_threshold*0.8])
+                print(f"      MESH STATUS: {'RESTORED' if restored else 'STILL_CRITICAL'}")
             else:
-                actual_center = np.mean(self.vertices, axis=0)
-            
-            center_drift = actual_center - self.center_position
-            
-            # Allow reasonable center drift to maintain mesh coherence
-            max_drift = self.length * 0.05  # Slightly increased drift allowance
-            drift_magnitude = np.linalg.norm(center_drift)
-            if drift_magnitude > max_drift:
-                center_drift = center_drift * (max_drift / drift_magnitude)
-            
-            self.center_position += center_drift * 0.03  # Gentle center adjustment
-    
+                movement_ok = center_movement_magnitude > 0.0005  # Lower threshold for movement
+                print(f"      MOVEMENT STATUS: {'OK' if movement_ok else 'SLOW'}")
+
     def _would_vertex_exit_vessel(self, position: np.ndarray, buffer_factor: float = 1.0) -> bool:
         """Check if a vertex position would be outside the blood vessel with adjustable buffer"""
         # Assume vessel is centered in domain - adjust these if vessel geometry is different
@@ -797,7 +1105,7 @@ class DeformableSporozoiteMesh:
         return radial_distance > vessel_radius
     
     def to_vtk_polydata(self) -> vtk.vtkPolyData:
-        """Convert mesh to VTK PolyData for visualization"""
+        """Convert mesh to VTK PolyData for visualization - FIXED for ParaView compatibility"""
         polydata = vtk.vtkPolyData()
         
         # Add points
@@ -806,61 +1114,67 @@ class DeformableSporozoiteMesh:
             points.InsertNextPoint(vertex[0], vertex[1], vertex[2])
         polydata.SetPoints(points)
         
-        # Add faces
+        # Add faces - FIXED: Proper error handling and validation
         polys = vtk.vtkCellArray()
+        valid_faces = 0
+        
         for face in self.faces:
-            poly = vtk.vtkPolygon()
-            poly.GetPointIds().SetNumberOfIds(len(face))
-            for i, vertex_id in enumerate(face):
-                poly.GetPointIds().SetId(i, vertex_id)
-            polys.InsertNextCell(poly)
+            # Validate face indices
+            valid_face = True
+            for vertex_id in face:
+                if vertex_id < 0 or vertex_id >= len(self.vertices):
+                    valid_face = False
+                    break
+            
+            if valid_face and len(face) >= 3:
+                # Create polygon only for valid faces
+                poly = vtk.vtkPolygon()
+                poly.GetPointIds().SetNumberOfIds(len(face))
+                for i, vertex_id in enumerate(face):
+                    poly.GetPointIds().SetId(i, int(vertex_id))  # Ensure integer type
+                polys.InsertNextCell(poly)
+                valid_faces += 1
+        
         polydata.SetPolys(polys)
         
-        # DEBUG: Print sporozoite ID being written to VTK
-        #print(f"VTK DEBUG: Writing sporozoite ID {self.id} to polydata with {len(self.vertices)} vertices")
+        # Add vertex data arrays
+        num_points = len(self.vertices)
         
-        # Add vertex data
-        # Viability
+        # Viability (use as scalars for default coloring)
         viability_array = vtk.vtkFloatArray()
         viability_array.SetName("Viability")
-        for _ in self.vertices:
-            viability_array.InsertNextValue(self.viability)
+        viability_array.SetNumberOfTuples(num_points)
+        for i in range(num_points):
+            viability_array.SetValue(i, float(self.viability))
         polydata.GetPointData().SetScalars(viability_array)
         
         # Velocity magnitude
         velocity_array = vtk.vtkFloatArray()
         velocity_array.SetName("VelocityMagnitude")
-        for i in range(len(self.vertices)):
-            vel_mag = np.linalg.norm(self.velocity[i])
-            velocity_array.InsertNextValue(vel_mag)
+        velocity_array.SetNumberOfTuples(num_points)
+        for i in range(num_points):
+            if i < len(self.velocity):
+                vel_mag = np.linalg.norm(self.velocity[i])
+            else:
+                vel_mag = 0.0
+            velocity_array.SetValue(i, float(vel_mag))
         polydata.GetPointData().AddArray(velocity_array)
         
         # Motility
         motility_array = vtk.vtkFloatArray()
         motility_array.SetName("Motility")
-        for _ in self.vertices:
-            motility_array.InsertNextValue(self.motility)
+        motility_array.SetNumberOfTuples(num_points)
+        for i in range(num_points):
+            motility_array.SetValue(i, float(self.motility))
         polydata.GetPointData().AddArray(motility_array)
         
-        # Sporozoite ID - FIXED WITH DEBUGGING
+        # Sporozoite ID - FIXED: Proper array creation
         id_array = vtk.vtkIntArray()
         id_array.SetName("SporozoiteID")
-        for vertex_idx in range(len(self.vertices)):
-            id_array.InsertNextValue(self.id)
-            # DEBUG: Print first few ID assignments
-            #if vertex_idx < 3:
-                #print(f"  VTK DEBUG: Vertex {vertex_idx} assigned ID {self.id}")
+        id_array.SetNumberOfTuples(num_points)
+        for i in range(num_points):
+            id_array.SetValue(i, int(self.id))
         polydata.GetPointData().AddArray(id_array)
-        
-        # DEBUG: Verify the ID array was created correctly
-        retrieved_id_array = polydata.GetPointData().GetArray("SporozoiteID")
-        if retrieved_id_array:
-            #print(f"  VTK DEBUG: ID array created with {retrieved_id_array.GetNumberOfTuples()} values")
-            if retrieved_id_array.GetNumberOfTuples() > 0:
-                first_id = retrieved_id_array.GetValue(0)
-                #print(f"  VTK DEBUG: First ID value in array: {first_id}")
-        else:
-            print(f"  VTK ERROR: Failed to create SporozoiteID array!")
         
         return polydata
     

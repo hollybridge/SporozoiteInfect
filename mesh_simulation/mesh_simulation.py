@@ -31,7 +31,7 @@ class MeshBasedSporozoiteSimulation:
     High-resolution simulation with deformable mesh sporozoites
     """
     
-    def __init__(self, num_sporozoites: int = 5, domain_size: tuple = (100.0, 100.0, 50.0), 
+    def __init__(self, num_sporozoites: int = 5, domain_size: tuple = (200.0, 200.0, 200.0), 
                  config=None, use_blood_flow: bool = False, flow_type: str = "laminar",
                  inlet_velocity: float = 50.0, vessel_diameter: float = 20.0):
         self.num_sporozoites = num_sporozoites
@@ -271,15 +271,104 @@ class MeshBasedSporozoiteSimulation:
                 # Calculate forces for this sporozoite
                 forces = {}
                 
-                # Directional movement force
+                # Directional movement force - START with sporozoite's intrinsic direction
                 direction_vec = np.array([np.cos(sporozoite.direction), np.sin(sporozoite.direction), 0])
-                forces['directional'] = direction_vec * self.config.DIRECTIONAL_FORCE_STRENGTH
+                intrinsic_directional_force = direction_vec * self.config.DIRECTIONAL_FORCE_STRENGTH
                 
-                # FIXED: Add blood flow/tissue forces to the directional forces
+                # FIXED: Add blood flow forces more gently to prevent mesh collapse
+                if self.use_blood_flow and hasattr(self.environment_field, 'apply_flow_forces'):
+                    # Get blood flow forces at sporozoite center
+                    sporozoite_velocity = np.array([
+                        np.cos(sporozoite.direction), 
+                        np.sin(sporozoite.direction), 
+                        0
+                    ]) * sporozoite.motility * sporozoite.max_speed
+                    
+                    # Apply flow forces but scale them down significantly
+                    blood_flow_force = self.environment_field.apply_flow_forces(
+                        sporozoite.center_position, sporozoite_velocity)
+                    
+                    # Scale down blood flow forces to prevent overwhelming internal forces
+                    # and add them gently to directional movement
+                    scaled_flow_force = blood_flow_force * 0.1  # Further 10x reduction
+                    intrinsic_directional_force += scaled_flow_force
+                
+                # Apply tissue/blood flow forces through the tissue interface
+                sporozoite.apply_tissue_forces(self.tissue_field, self.dt)
+                
+                # Add tissue forces to directional forces (these are already scaled appropriately)
                 if hasattr(sporozoite, 'tissue_flow_force'):
-                    forces['directional'] += sporozoite.tissue_flow_force
+                    intrinsic_directional_force += sporozoite.tissue_flow_force * 0.5  # Additional scaling
                 if hasattr(sporozoite, 'tissue_resistance_force'):
-                    forces['directional'] += sporozoite.tissue_resistance_force
+                    intrinsic_directional_force += sporozoite.tissue_resistance_force * 0.5  # Additional scaling
+                
+                # COUPLED PHYSICS: Blend sporozoite autonomy with flow alignment based on PÉCLET NUMBER
+                if self.use_blood_flow:
+                    # Set blood flow flag on sporozoite for emergency shape recovery
+                    sporozoite.in_blood_flow = True
+                    
+                    # Get blood flow direction at sporozoite position
+                    blood_velocity = self.environment_field.get_velocity_at_point(sporozoite.center_position)
+                    flow_magnitude = np.linalg.norm(blood_velocity)
+                    
+                    if flow_magnitude > 1e-6:
+                        # PROPER PÉCLET NUMBER PHYSICS - Calculate Pe = UL/D
+                        # where U=flow speed, L=characteristic length, D=effective diffusivity
+                        
+                        # Characteristic length = sporozoite length
+                        characteristic_length = sporozoite.length
+                        
+                        # Effective diffusivity scales with motility and swimming capability
+                        # D ~ motility * swimming_speed * persistence_length
+                        # For sporozoites: D ~ 10-100 μm²/s depending on activity
+                        base_diffusivity = 10.0  # μm²/s - base diffusion
+                        motility_diffusivity = sporozoite.motility * sporozoite.max_speed * 0.5  # Swimming contribution
+                        effective_diffusivity = base_diffusivity + motility_diffusivity
+                        
+                        # Calculate Péclet number
+                        peclet_number = (flow_magnitude * characteristic_length) / effective_diffusivity
+                        
+                        # PHYSICALLY-BASED COUPLING using Péclet number
+                        # Pe << 1: Diffusion/motility dominated (sporozoite controls)
+                        # Pe >> 1: Advection dominated (flow controls)
+                        # Pe ~ 1: Transition regime (mixed control)
+                        
+                        # Smooth transition function: f(Pe) = Pe/(1+Pe)
+                        # This gives: Pe=0.1 -> 9% flow, Pe=1 -> 50% flow, Pe=10 -> 91% flow
+                        flow_weight = peclet_number / (1.0 + peclet_number)
+                        sporozoite_weight = 1.0 - flow_weight
+                        
+                        # Additional correction for very high motility sporozoites
+                        # Highly motile sporozoites can swim against moderate flows
+                        if sporozoite.motility > 0.7 and peclet_number < 5.0:
+                            # High-motility sporozoites resist flow more effectively
+                            motility_resistance_factor = (sporozoite.motility - 0.7) / 0.3  # 0 to 1 scale
+                            flow_weight *= (1.0 - 0.3 * motility_resistance_factor)
+                            sporozoite_weight = 1.0 - flow_weight
+                        
+                        # Get flow-aligned directional force
+                        flow_direction = blood_velocity / flow_magnitude
+                        flow_aligned_force = flow_direction * self.config.DIRECTIONAL_FORCE_STRENGTH * 0.4
+                        
+                        # BLEND the forces based on Péclet physics
+                        forces['directional'] = (
+                            intrinsic_directional_force * sporozoite_weight + 
+                            flow_aligned_force * flow_weight
+                        )
+                        
+                        print(f"    PÉCLET PHYSICS: Sporozoite {sporozoite.id}")
+                        print(f"      Pe = UL/D = {flow_magnitude:.2f} × {characteristic_length:.2f} / {effective_diffusivity:.2f} = {peclet_number:.2f}")
+                        print(f"      Flow weight: {flow_weight:.3f}, Sporozoite weight: {sporozoite_weight:.3f}")
+                        print(f"      Flow regime: {'ADVECTION' if peclet_number > 2 else 'MIXED' if peclet_number > 0.5 else 'DIFFUSION'} dominated")
+                        
+                    else:
+                        # No significant flow - use intrinsic forces with minimal flow influence
+                        forces['directional'] = intrinsic_directional_force * 0.8
+                        print(f"    LOW FLOW: Sporozoite {sporozoite.id} using primarily intrinsic direction (Pe ≈ 0)")
+                else:
+                    # Tissue simulation - use full intrinsic directional force
+                    sporozoite.in_blood_flow = False
+                    forces['directional'] = intrinsic_directional_force
                 
                 # Random movement
                 if np.random.random() < self.config.RANDOM_DIRECTION_PROBABILITY:
@@ -293,36 +382,45 @@ class MeshBasedSporozoiteSimulation:
                 
                 # Undulation forces (apply to each vertex)
                 undulation_forces = []
-                phase = sporozoite.undulation_phase + self.time * sporozoite.undulation_frequency * 2 * np.pi
                 
-                for i, vertex in enumerate(sporozoite.vertices):
-                    relative_pos = vertex - sporozoite.center_position
-                    body_position = np.dot(relative_pos, direction_vec)
-                    normalized_position = body_position / (sporozoite.length/2) if sporozoite.length > 0 else 0
+                # FOR BLOOD FLOW: Completely disable undulation forces to prevent deformation
+                if self.use_blood_flow and self.config.SPRING_CONSTANT_BASE >= 100:
+                    # Create zero undulation forces to maintain mesh shape
+                    for vertex in sporozoite.vertices:
+                        undulation_forces.append(np.zeros(3))
+                    print(f"    SHAPE PRESERVATION: Undulation forces disabled for sporozoite {sporozoite.id}")
+                else:
+                    # TISSUE SIMULATIONS: Apply controlled undulation forces
+                    phase = sporozoite.undulation_phase + self.time * sporozoite.undulation_frequency * 2 * np.pi
                     
-                    # Perpendicular undulation - CONTROLLED FOR STABLE DEFORMATION
-                    perpendicular = np.array([-np.sin(sporozoite.direction), np.cos(sporozoite.direction), 0])
-                    vertical = np.array([0, 0, 1])
-                    
-                    # Controlled wave amplitude for visible but stable deformation
-                    wave_amplitude = self.config.UNDULATION_AMPLITUDE * sporozoite.motility
-                    
-                    # Enhance forces for low spring constants but keep them reasonable
-                    if self.config.SPRING_CONSTANT_BASE < 20.0:
-                        wave_amplitude *= 1.5  # Moderate enhancement for flexible meshes
-                    
-                    # Create controlled undulation pattern
-                    lateral_phase = phase + normalized_position * 2 * np.pi  # Fewer waves for stability
-                    vertical_phase = phase + normalized_position * np.pi
-                    
-                    lateral_force = perpendicular * wave_amplitude * np.sin(lateral_phase)
-                    vertical_force = vertical * wave_amplitude * np.cos(vertical_phase) * 0.3
-                    
-                    # Add minimal random variation for natural movement
-                    random_component = np.random.normal(0, wave_amplitude * 0.05, 3)
-                    
-                    undulation_force = (lateral_force + vertical_force + random_component) * self.config.UNDULATION_FORCE_SCALE
-                    undulation_forces.append(undulation_force)
+                    for i, vertex in enumerate(sporozoite.vertices):
+                        relative_pos = vertex - sporozoite.center_position
+                        body_position = np.dot(relative_pos, direction_vec)
+                        normalized_position = body_position / (sporozoite.length/2) if sporozoite.length > 0 else 0
+                        
+                        # Perpendicular undulation - CONTROLLED FOR STABLE DEFORMATION
+                        perpendicular = np.array([-np.sin(sporozoite.direction), np.cos(sporozoite.direction), 0])
+                        vertical = np.array([0, 0, 1])
+                        
+                        # Controlled wave amplitude for visible but stable deformation
+                        wave_amplitude = self.config.UNDULATION_AMPLITUDE * sporozoite.motility
+                        
+                        # Enhance forces for low spring constants but keep them reasonable
+                        if self.config.SPRING_CONSTANT_BASE < 20.0:
+                            wave_amplitude *= 1.5  # Moderate enhancement for flexible meshes
+                        
+                        # Create controlled undulation pattern
+                        lateral_phase = phase + normalized_position * 2 * np.pi  # Fewer waves for stability
+                        vertical_phase = phase + normalized_position * np.pi
+                        
+                        lateral_force = perpendicular * wave_amplitude * np.sin(lateral_phase)
+                        vertical_force = vertical * wave_amplitude * np.cos(vertical_phase) * 0.3
+                        
+                        # Add minimal random variation for natural movement
+                        random_component = np.random.normal(0, wave_amplitude * 0.05, 3)
+                        
+                        undulation_force = (lateral_force + vertical_force + random_component) * self.config.UNDULATION_FORCE_SCALE
+                        undulation_forces.append(undulation_force)
                 
                 forces['undulation'] = undulation_forces
                 
@@ -373,7 +471,135 @@ class MeshBasedSporozoiteSimulation:
             self._apply_vessel_boundary_conditions(sporozoite)
     
     def _apply_domain_boundary_conditions(self, sporozoite):
-        """Apply domain boundary conditions using rigid body approach"""
+        """Apply domain boundary conditions with proper periodic BC for X-direction"""
+        center = sporozoite.center_position
+        damping = self.config.BOUNDARY_DAMPING
+        
+        # For blood flow simulations, implement true periodic boundary in X-direction
+        if self.use_blood_flow:
+            self._apply_periodic_boundary_x(sporozoite)
+        
+        # Apply reflective boundaries for Y and Z (and X for tissue simulations)
+        self._apply_reflective_boundaries(sporozoite)
+    
+    def _apply_periodic_boundary_x(self, sporozoite):
+        """Apply periodic boundary conditions in X-direction for blood flow"""
+        domain_x = self.domain_size[0]
+        
+        # Get sporozoite bounds
+        min_bounds, max_bounds = sporozoite.get_bounding_box()
+        
+        # Check if sporozoite has completely exited the domain
+        if min_bounds[0] > domain_x:
+            # Sporozoite has completely exited at the right boundary - teleport to left
+            self._teleport_sporozoite_periodic(sporozoite, 'right_to_left')
+            print(f"    PERIODIC BC: Sporozoite {sporozoite.id} teleported from right to left boundary")
+            
+        elif max_bounds[0] < 0:
+            # Sporozoite has completely exited at the left boundary - teleport to right
+            self._teleport_sporozoite_periodic(sporozoite, 'left_to_right')
+            print(f"    PERIODIC BC: Sporozoite {sporozoite.id} teleported from left to right boundary")
+            
+        # Handle partial crossing using ghost method
+        elif min_bounds[0] < 0 or max_bounds[0] > domain_x:
+            # Sporozoite is spanning the periodic boundary - use ghost sporozoite method
+            self._handle_periodic_spanning(sporozoite)
+            print(f"    PERIODIC BC: Sporozoite {sporozoite.id} spanning boundary - using ghost method")
+    
+    def _teleport_sporozoite_periodic(self, sporozoite, direction):
+        """Teleport sporozoite across periodic boundary preserving all properties"""
+        domain_x = self.domain_size[0]
+        
+        # Calculate the translation needed
+        if direction == 'right_to_left':
+            # Move from right side to left side
+            translation = np.array([-domain_x, 0, 0])
+        elif direction == 'left_to_right':
+            # Move from left side to right side
+            translation = np.array([domain_x, 0, 0])
+        else:
+            return
+        
+        # Store the old center position for debugging
+        old_center = sporozoite.center_position.copy()
+        
+        # Translate the sporozoite center
+        sporozoite.center_position += translation
+        
+        # Translate all vertices rigidly
+        for i in range(len(sporozoite.vertices)):
+            sporozoite.vertices[i] += translation
+        
+        # Preserve all velocities and forces (no damping for periodic BC)
+        # The sporozoite should continue with the same motion state
+        if hasattr(sporozoite, 'center_velocity'):
+            # Keep the same velocity - no change needed for periodic BC
+            pass
+        
+        # Debug output
+        print(f"      Teleported center: {old_center} -> {sporozoite.center_position}")
+        print(f"      Translation applied: {translation}")
+        
+        # Verify the teleportation worked
+        new_bounds = sporozoite.get_bounding_box()
+        print(f"      New bounds: [{new_bounds[0][0]:.2f}, {new_bounds[1][0]:.2f}] in X")
+    
+    def _handle_periodic_spanning(self, sporozoite):
+        """Handle sporozoite spanning the periodic boundary using ghost method"""
+        domain_x = self.domain_size[0]
+        center_x = sporozoite.center_position[0]
+        
+        # Determine which side the center is on and create appropriate ghost
+        if center_x > domain_x / 2:
+            # Center is on right side - create ghost on left side
+            ghost_translation = np.array([-domain_x, 0, 0])
+            primary_side = 'right'
+        else:
+            # Center is on left side - create ghost on right side
+            ghost_translation = np.array([domain_x, 0, 0])
+            primary_side = 'left'
+        
+        # For spring force calculations, use the closest representation of each vertex
+        # This prevents springs from stretching across the domain
+        if hasattr(sporozoite, 'edge_list') and hasattr(sporozoite, 'rest_lengths'):
+            # Temporarily modify vertices for spring force calculation
+            modified_vertices = sporozoite.vertices.copy()
+            
+            for edge_idx, (v1, v2) in enumerate(sporozoite.edge_list):
+                if v1 < len(modified_vertices) and v2 < len(modified_vertices):
+                    # Check if this edge spans the boundary
+                    vertex1 = modified_vertices[v1]
+                    vertex2 = modified_vertices[v2]
+                    
+                    # If the edge spans more than half the domain, use ghost vertex
+                    if abs(vertex1[0] - vertex2[0]) > domain_x / 2:
+                        if primary_side == 'right' and vertex1[0] < domain_x / 2:
+                            # Use ghost version of vertex1
+                            modified_vertices[v1] = vertex1 + np.array([domain_x, 0, 0])
+                        elif primary_side == 'right' and vertex2[0] < domain_x / 2:
+                            # Use ghost version of vertex2
+                            modified_vertices[v2] = vertex2 + np.array([domain_x, 0, 0])
+                        elif primary_side == 'left' and vertex1[0] > domain_x / 2:
+                            # Use ghost version of vertex1
+                            modified_vertices[v1] = vertex1 + np.array([-domain_x, 0, 0])
+                        elif primary_side == 'left' and vertex2[0] > domain_x / 2:
+                            # Use ghost version of vertex2
+                            modified_vertices[v2] = vertex2 + np.array([-domain_x, 0, 2])
+            
+            # Store original vertices to restore after physics calculation
+            original_vertices = sporozoite.vertices.copy()
+            
+            # Temporarily set the modified vertices for physics calculation
+            sporozoite.vertices = modified_vertices
+            
+            # Mark that we need to restore vertices after this time step
+            sporozoite._needs_vertex_restore = True
+            sporozoite._original_vertices_backup = original_vertices
+        
+        print(f"      Ghost method applied - primary side: {primary_side}")
+    
+    def _apply_reflective_boundaries(self, sporozoite):
+        """Apply reflective boundary conditions for Y, Z (and X for tissue)"""
         center = sporozoite.center_position
         damping = self.config.BOUNDARY_DAMPING
         
@@ -382,17 +608,8 @@ class MeshBasedSporozoiteSimulation:
         
         # Check if any vertices are out of domain bounds
         for vertex in sporozoite.vertices:
-            # X boundaries - PERIODIC for blood flow
-            if self.use_blood_flow:
-                # Periodic boundary in X direction (flow direction)
-                if vertex[0] <= 0:
-                    correction_needed = self.domain_size[0] - 0.1 - vertex[0]
-                    center_correction[0] = min(center_correction[0], correction_needed)
-                elif vertex[0] >= self.domain_size[0]:
-                    correction_needed = 0.1 - vertex[0]
-                    center_correction[0] = max(center_correction[0], correction_needed)
-            else:
-                # Reflective boundaries for tissue simulations
+            # X boundaries - only for tissue simulations (blood flow uses periodic)
+            if not self.use_blood_flow:
                 if vertex[0] <= 0:
                     correction_needed = 0.1 - vertex[0]
                     center_correction[0] = max(center_correction[0], correction_needed)
@@ -423,13 +640,28 @@ class MeshBasedSporozoiteSimulation:
             for i in range(len(sporozoite.vertices)):
                 sporozoite.vertices[i] += center_correction
             
-            # Apply damping to velocities
+            # Apply damping to velocities for reflective boundaries
             if hasattr(sporozoite, 'vertex_velocities'):
                 for i in range(len(sporozoite.vertex_velocities)):
-                    sporozoite.vertex_velocities[i] *= damping
+                    # Apply damping and reverse velocity component normal to boundary
+                    velocity = sporozoite.vertex_velocities[i]
+                    
+                    # Reverse X velocity if hitting X boundaries (tissue only)
+                    if not self.use_blood_flow and abs(center_correction[0]) > 1e-8:
+                        velocity[0] = -velocity[0] * damping
+                    
+                    # Reverse Y velocity if hitting Y boundaries
+                    if abs(center_correction[1]) > 1e-8:
+                        velocity[1] = -velocity[1] * damping
+                    
+                    # Reverse Z velocity if hitting Z boundaries
+                    if abs(center_correction[2]) > 1e-8:
+                        velocity[2] = -velocity[2] * damping
+                    
+                    sporozoite.vertex_velocities[i] = velocity
     
     def _apply_vessel_boundary_conditions(self, sporozoite):
-        """Apply gentle vessel boundary conditions to keep sporozoites within blood vessel"""
+        """Apply vessel boundary conditions using repulsive potential field"""
         if not hasattr(self.environment_field, 'vessel_diameter'):
             return
         
@@ -440,75 +672,136 @@ class MeshBasedSporozoiteSimulation:
         y_center = self.domain_size[1] / 2
         z_center = self.domain_size[2] / 2
         
-        # Check if sporozoite center is outside vessel
+        # Get sporozoite center position
         center_y = sporozoite.center_position[1]
         center_z = sporozoite.center_position[2]
         
         # Distance from vessel centerline
         radial_distance = np.sqrt((center_y - y_center)**2 + (center_z - z_center)**2)
         
-        # Allow more buffer space inside vessel (85% of radius instead of 90%)
-        max_allowed_radius = vessel_radius * 0.85
+        # Apply repulsive potential to ALL vertices, not just center
+        total_boundary_force = np.zeros(3)
+        vertex_boundary_forces = []
         
-        if radial_distance > max_allowed_radius:
-            # Calculate gentle correction to move sporozoite back inside vessel
-            if radial_distance > 1e-8:
-                # Direction from vessel center to sporozoite
-                radial_direction_y = (center_y - y_center) / radial_distance
-                radial_direction_z = (center_z - z_center) / radial_distance
-                
-                # New position at max allowed radius
-                new_center_y = y_center + radial_direction_y * max_allowed_radius
-                new_center_z = z_center + radial_direction_z * max_allowed_radius
-                
-                # Calculate gentle correction needed
-                correction_y = (new_center_y - center_y) * 0.1  # Only 10% correction per step
-                correction_z = (new_center_z - center_z) * 0.1  # Very gentle
-                
-                # Apply correction to center and all vertices
-                sporozoite.center_position[1] += correction_y
-                sporozoite.center_position[2] += correction_z
-                
-                for i in range(len(sporozoite.vertices)):
-                    sporozoite.vertices[i][1] += correction_y
-                    sporozoite.vertices[i][2] += correction_z
-                
-                # Apply gentle damping when approaching vessel walls
-                vessel_wall_damping = 0.9  # Much gentler damping
-                if hasattr(sporozoite, 'vertex_velocities'):
-                    for i in range(len(sporozoite.vertex_velocities)):
-                        # Gently reduce radial velocity components
-                        vel = sporozoite.vertex_velocities[i]
-                        vel[1] *= vessel_wall_damping  # Y velocity
-                        vel[2] *= vessel_wall_damping  # Z velocity
-                        vel[0] *= 0.95  # X velocity (very gentle damping for flow direction)
-                
-                # Debug output for vessel boundary corrections
-                print(f"  VESSEL BOUNDARY: Sporozoite {sporozoite.id} gently moved back inside vessel "
-                      f"(was {radial_distance:.2f}, target {max_allowed_radius:.2f})")
+        for i, vertex in enumerate(sporozoite.vertices):
+            vertex_y = vertex[1]
+            vertex_z = vertex[2]
+            
+            # Distance of this vertex from vessel centerline
+            vertex_radial_distance = np.sqrt((vertex_y - y_center)**2 + (vertex_z - z_center)**2)
+            
+            # Calculate repulsive force using Lennard-Jones-like potential
+            boundary_force = self._calculate_vessel_repulsive_force(
+                vertex_y, vertex_z, y_center, z_center, vessel_radius, vertex_radial_distance
+            )
+            
+            vertex_boundary_forces.append(boundary_force)
+            total_boundary_force += boundary_force
         
-        # Remove the aggressive vertex-by-vertex corrections that were causing instability
-        # The gentler center-based correction above should be sufficient
+        # Apply boundary forces to each vertex through the sporozoite's force system
+        # Add these as additional external forces during motion update
+        if not hasattr(sporozoite, 'vessel_boundary_forces'):
+            sporozoite.vessel_boundary_forces = vertex_boundary_forces
+        else:
+            sporozoite.vessel_boundary_forces = vertex_boundary_forces
+        
+        # Debug output for significant boundary forces
+        total_force_magnitude = np.linalg.norm(total_boundary_force)
+        if total_force_magnitude > 0.1:
+            print(f"  VESSEL POTENTIAL: Sporozoite {sporozoite.id} experiencing boundary force "
+                  f"(magnitude: {total_force_magnitude:.3f}, radial distance: {radial_distance:.2f})")
     
-    def _write_sporozoite_vtk(self, step_number: int):
-        """Write sporozoite mesh data to VTK with proper time information for animation"""
-        if not self.sporozoites:
-            print(f"VTK WRITE DEBUG: No sporozoites to write at step {step_number}")
-            return
+    def _calculate_vessel_repulsive_force(self, vertex_y, vertex_z, y_center, z_center, 
+                                        vessel_radius, radial_distance):
+        """Calculate repulsive force from vessel walls - ULTRA-GENTLE VERSION for shape preservation"""
         
-        # Create multi-block dataset for all sporozoites
+        # ULTRA-GENTLE repulsive potential parameters to prevent rod deformation
+        wall_strength = 0.5      # Much weaker strength (10x reduction)
+        wall_range = vessel_radius * 0.4  # Even wider range (40% of radius)
+        repulsion_start = vessel_radius * 0.85  # Start repulsion later (85% of radius)
+        
+        # Calculate distance from wall (positive = inside vessel, negative = outside)
+        distance_from_wall = vessel_radius - radial_distance
+        
+        # Only apply repulsive force if vertex is very close to or outside the wall
+        if distance_from_wall < wall_range:
+            # Direction from vessel center to vertex (radial outward direction)
+            if radial_distance > 1e-8:
+                radial_direction_y = (vertex_y - y_center) / radial_distance
+                radial_direction_z = (vertex_z - z_center) / radial_distance
+            else:
+                # If at center, choose random radial direction
+                angle = np.random.uniform(0, 2*np.pi)
+                radial_direction_y = np.cos(angle)
+                radial_direction_z = np.sin(angle)
+            
+            # ULTRA-SMOOTH potential function with minimal forces
+            if distance_from_wall > 0:
+                # Inside vessel but approaching wall - very gentle nudge
+                normalized_distance = distance_from_wall / wall_range
+                # Use linear potential for even gentler forces
+                force_magnitude = wall_strength * (1 - normalized_distance) * (-0.5)  # Very gentle inward force
+            else:
+                # Outside vessel - moderate but controlled inward force
+                penetration = abs(distance_from_wall)
+                penetration_factor = penetration / (vessel_radius * 0.2)  # Scale by 20% of radius
+                # Use square root growth to avoid steep forces
+                force_magnitude = wall_strength * np.sqrt(1 + penetration_factor) * (-1.5)  # Moderate inward force
+            
+            # Cap maximum force to prevent any deformation
+            max_force_magnitude = wall_strength * 3.0  # Much lower maximum (was 10x)
+            if abs(force_magnitude) > max_force_magnitude:
+                force_magnitude = max_force_magnitude * (-1 if force_magnitude < 0 else 1)
+            
+            # Apply force in radial direction (negative = toward center)
+            force_y = radial_direction_y * force_magnitude
+            force_z = radial_direction_z * force_magnitude
+            force_x = 0.0  # No force in flow direction
+            
+            return np.array([force_x, force_y, force_z])
+        
+        else:
+            # Far from walls - no boundary force
+            return np.zeros(3)
+
+    def _write_sporozoite_vtk(self, step_number: int):
+        """Write sporozoite meshes to VTK with proper time information for animation"""
         multiblock = vtk.vtkMultiBlockDataSet()
         multiblock.SetNumberOfBlocks(len(self.sporozoites))
         
-        # Add time information to the dataset
-        time_array = vtk.vtkDoubleArray()
-        time_array.SetName("TimeValue")
-        time_array.SetNumberOfTuples(1)
-        time_array.SetValue(0, self.time)
-        multiblock.GetFieldData().AddArray(time_array)
-        
         for i, sporozoite in enumerate(self.sporozoites):
+            # Validate sporozoite dimensions
+            bounds = sporozoite.get_bounding_box()
+            dimensions = bounds[1] - bounds[0]
+            
+            if np.any(dimensions < 0.01):
+                print(f"    WARNING: Sporozoite {sporozoite.id} has very small dimensions - may be invisible!")
+                print(f"      Attempting mesh recovery...")
+                
+                # Try to restore mesh from original positions
+                if hasattr(sporozoite, 'original_relative_positions'):
+                    print(f"      Restoring from original positions...")
+                    for j, orig_rel_pos in enumerate(sporozoite.original_relative_positions):
+                        if j < len(sporozoite.vertices):
+                            sporozoite.vertices[j] = sporozoite.center_position + orig_rel_pos
+                    
+                    # Recalculate bounds after restoration
+                    bounds = sporozoite.get_bounding_box()
+                    dimensions = bounds[1] - bounds[0]
+                    print(f"      After restoration: [{dimensions[0]:.4f}, {dimensions[1]:.4f}, {dimensions[2]:.4f}]")
+            
+            # Convert to VTK with validation
             polydata = sporozoite.to_vtk_polydata()
+            
+            # Validate the polydata
+            if polydata.GetNumberOfPoints() == 0:
+                print(f"    ERROR: Sporozoite {sporozoite.id} has no points!")
+                continue
+            if polydata.GetNumberOfPolys() == 0:
+                print(f"    ERROR: Sporozoite {sporozoite.id} has no polygons!")
+                continue
+            
+            print(f"    VTK Data: {polydata.GetNumberOfPoints()} points, {polydata.GetNumberOfPolys()} polys")
             
             # Add time information to each block as well
             time_array_block = vtk.vtkDoubleArray()
@@ -529,6 +822,11 @@ class MeshBasedSporozoiteSimulation:
         writer.SetDataModeToAscii()  # Use ASCII format for better compatibility
         writer.SetCompressorTypeToNone()  # Disable compression to avoid binary issues
         writer.Write()
+        
+        print(f"VTK DEBUG: Successfully wrote {filename}")
+        
+        # Update the time series collection file
+        self._update_sporozoites_time_series_collection(step_number)
 
     def _write_tissue_field_vtk(self, step_number: int):
         """Write tissue field data to VTK with proper time information for animation"""
@@ -881,8 +1179,9 @@ class MeshBasedSporozoiteSimulation:
         if insert_index == -1:
             return
         
-        # Create the new entry for sporozoites
-        vtm_file = f"sporozoites_{step_number:04d}.vtm"
+        # Create the new entry for sporozoites - use simple sequential naming for ParaView compatibility
+        # Format: sporozoite_XXXX.vtm (ParaView prefers simple sequential names)
+        vtm_file = f"sporozoite_{step_number:04d}.vtm"
         new_entry = f'    <DataSet timestep="{self.time:.6f}" group="" part="0" file="{vtm_file}"/>\n'
         
         # Insert the new entry

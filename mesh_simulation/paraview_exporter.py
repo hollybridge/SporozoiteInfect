@@ -186,11 +186,24 @@ class SporozoiteParaViewExporter:
             print("No sporozoites to export")
             return None
         
-        if filename_prefix is None:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename_prefix = f"multiple_sporozoites_{len(sporozoites)}_{timestamp}"
-        
-        filename = os.path.join(self.output_dir, f"{filename_prefix}_meshes.vtm")
+        # FIXED: For debug files, use simple naming that matches time series expectations
+        if filename_prefix and filename_prefix.startswith("debug_sporozoite_"):
+            # Use direct naming: debug_sporozoite_0001.vtm (no "_meshes" suffix)
+            filename = os.path.join(self.output_dir, f"{filename_prefix}.vtm")
+        elif filename_prefix and filename_prefix.startswith("step_"):
+            # Extract step number from "step_0001_timestamp" format for regular simulations
+            parts = filename_prefix.split("_")
+            if len(parts) >= 2 and parts[1].isdigit():
+                step_number = parts[1]
+                filename = os.path.join(self.output_dir, f"sporozoite_{step_number}.vtm")
+            else:
+                filename = os.path.join(self.output_dir, f"{filename_prefix}_meshes.vtm")
+        else:
+            # Default naming for other files
+            if filename_prefix is None:
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename_prefix = f"multiple_sporozoites_{len(sporozoites)}_{timestamp}"
+            filename = os.path.join(self.output_dir, f"{filename_prefix}_meshes.vtm")
         
         # Create multi-block dataset
         multiblock = vtk.vtkMultiBlockDataSet()
