@@ -26,15 +26,15 @@ except ImportError:
     class CenterlineConfig:
         def __init__(self):
             self.CENTERLINE_SEGMENTS = 10
-            self.STRETCH_STIFFNESS = 1000.0
-            self.BENDING_STIFFNESS = 1000.0
-            self.PROPULSIVE_FORCE_AMPLITUDE = 50.0
-            self.CENTERLINE_DAMPING = 0.8
+            self.STRETCH_STIFFNESS = 200.0  # Reduced from 1000
+            self.BENDING_STIFFNESS = 200.0  # Reduced from 1000
+            self.PROPULSIVE_FORCE_AMPLITUDE = 150.0  # Increased from 50
+            self.CENTERLINE_DAMPING = 0.3  # Reduced from 0.8
             self.NOISE_STRENGTH = 0.0
             self.BOUNDARY_REPULSION_STRENGTH = 5.0
             self.VIABILITY_DECAY_RATE = 0.01
             self.TIME_STEP = 0.008
-            self.MAX_TIME = 12.0
+            self.MAX_TIME = 5.0
             self.OUTPUT_INTERVAL = 0.08
             self.SPOROZOITE_LENGTH_RANGE = (12.0, 18.0)
             self.SPOROZOITE_DIAMETER_RANGE = (1.0, 2.0)
@@ -54,21 +54,164 @@ class CenterlineArcNode:
         self.force = np.zeros(3)
         self.node_id = node_id
         
-        # LJ force parameters
-        self.sigma = 0.5  # LJ length scale (μm)
-        self.epsilon = 1.0  # LJ energy scale
-        self.cutoff_distance = 2.0  # Cutoff for LJ interactions (μm)
+        # LJ force parameters - STRENGTHENED for better repulsion
+        self.sigma = 1.0  # Increased from 0.5 - LJ length scale (μm)
+        self.epsilon = 20.0  # Increased from 1.0 - Much stronger energy scale
+        self.cutoff_distance = 3.0  # Increased from 2.0 - Longer range interactions (μm)
+
+
+class SimpleSporozoiteMeshGeometry:
+    """Simple mesh geometry generator for visualization - NO PHYSICS"""
+    
+    def __init__(self, sporozoite_id: int, center_position: np.ndarray, length: float, diameter: float):
+        self.id = sporozoite_id
+        self.center_position = center_position.copy()
+        self.length = length
+        self.diameter = diameter
+        
+        # Mesh parameters (simplified)
+        self.n_segments = 8  # Longitudinal segments
+        self.n_radial = 6    # Radial segments
+        
+        # Create mesh geometry
+        self.vertices = None
+        self.faces = None
+        self.original_relative_positions = None
+        
+        self._create_simple_mesh()
+    
+    def _create_simple_mesh(self):
+        """Create simple curved rod mesh - GEOMETRY MATCHING THE CIRCULAR ARC"""
+        vertices = []
+        faces = []
+        
+        # Generate curved spine MATCHING the actual circular arc geometry used by nodes
+        # Instead of a sine curve, use the same arc geometry as the centerline nodes
+        t_values = np.linspace(0, 1, self.n_segments)
+        spine_points = []
+        
+        # FIXED: Use the same circular arc geometry as the centerline nodes
+        # Arc parameters (matching SporozoiteCenterlineArc)
+        sporozoite_length = self.length  # Total length of sporozoite
+        arc_angle = np.pi / 2  # 90 degrees
+        radius_of_curvature = sporozoite_length / arc_angle  # Same as nodes
+        
+        for i, t in enumerate(t_values):
+            # Parameter along the 90-degree arc (0 to 1)
+            # Angle within the 90-degree arc (-45° to +45° relative to direction)
+            local_angle = (t - 0.5) * arc_angle
+            
+            # Position on the circular arc (centered at origin)
+            x = radius_of_curvature * np.cos(local_angle) - radius_of_curvature  # Offset to center
+            y = radius_of_curvature * np.sin(local_angle)
+            z = 0
+            spine_points.append([x, y, z])
+        
+        spine_points = np.array(spine_points)
+        
+        # Create cross-sections
+        for i, spine_point in enumerate(spine_points):
+            # Calculate local coordinate system
+            if i == 0:
+                tangent = spine_points[i+1] - spine_points[i] if i < len(spine_points) - 1 else np.array([1, 0, 0])
+            elif i == len(spine_points) - 1:
+                tangent = spine_points[i] - spine_points[i-1]
+            else:
+                tangent = spine_points[i+1] - spine_points[i-1]
+            
+            tangent_norm = np.linalg.norm(tangent)
+            if tangent_norm > 1e-8:
+                tangent = tangent / tangent_norm
+            else:
+                tangent = np.array([1, 0, 0])
+            
+            # Create perpendicular vectors
+            if abs(tangent[2]) < 0.9:
+                normal = np.cross(tangent, [0, 0, 1])
+            else:
+                normal = np.cross(tangent, [1, 0, 0])
+            
+            normal_norm = np.linalg.norm(normal)
+            if normal_norm > 1e-8:
+                normal = normal / normal_norm
+            else:
+                normal = np.array([0, 1, 0])
+            
+            binormal = np.cross(tangent, normal)
+            binormal_norm = np.linalg.norm(binormal)
+            if binormal_norm > 1e-8:
+                binormal = binormal / binormal_norm
+            else:
+                binormal = np.array([0, 0, 1])
+            
+            # Radius varies along length (tapered ends)
+            radius_factor = np.sin(np.pi * i / (self.n_segments - 1))
+            radius_factor = max(0.1, radius_factor)
+            radius = self.diameter/2 * radius_factor
+            
+            # Create circular cross-section
+            for j in range(self.n_radial):
+                angle = 2 * np.pi * j / self.n_radial
+                local_point = (normal * np.cos(angle) + binormal * np.sin(angle)) * radius
+                vertex = spine_point + local_point  # Relative to origin
+                vertices.append(vertex)
+        
+        # Create faces
+        for i in range(self.n_segments - 1):
+            for j in range(self.n_radial):
+                curr_ring = i * self.n_radial
+                next_ring = (i + 1) * self.n_radial
+                curr_j = j
+                next_j = (j + 1) % self.n_radial
+                
+                v1 = curr_ring + curr_j
+                v2 = curr_ring + next_j
+                v3 = next_ring + next_j
+                v4 = next_ring + curr_j
+                
+                faces.append([v1, v2, v3])
+                faces.append([v1, v3, v4])
+        
+        # Add end caps
+        center_start = len(vertices)
+        vertices.append(spine_points[0])
+        center_end = len(vertices)
+        vertices.append(spine_points[-1])
+        
+        # Start cap
+        for j in range(self.n_radial):
+            next_j = (j + 1) % self.n_radial
+            faces.append([center_start, j, next_j])
+        
+        # End cap
+        last_ring_start = (self.n_segments - 1) * self.n_radial
+        for j in range(self.n_radial):
+            next_j = (j + 1) % self.n_radial
+            faces.append([center_end, last_ring_start + next_j, last_ring_start + j])
+        
+        # Store geometry
+        vertices = np.array(vertices)
+        self.original_relative_positions = vertices.copy()  # Relative to origin
+        self.vertices = vertices + self.center_position  # Global positions
+        self.faces = np.array(faces)
+    
+    def update_position(self, new_center: np.ndarray):
+        """Update mesh position - PURE GEOMETRY, NO PHYSICS"""
+        self.center_position = new_center.copy()
+        
+        # Simply translate all vertices to new center position
+        for i in range(len(self.vertices)):
+            if i < len(self.original_relative_positions):
+                relative_pos = self.original_relative_positions[i]
+                # Position relative to new center (pure translation, no rotation)
+                self.vertices[i] = new_center + relative_pos
 
 class SporozoiteCenterlineArc:
-    """Sporozoite represented as centerline with arc nodes"""
+    """Sporozoite as a 90-degree arc that moves forward along a circular path WITH 3D mesh body"""
     
     def __init__(self, sporozoite_id: int, initial_center: np.ndarray, config):
         self.id = sporozoite_id
         self.config = config
-        
-        # Motion parameters (initialize BEFORE creating nodes)
-        self.direction = np.random.uniform(0, 2 * np.pi)
-        self.undulation_phase = np.random.uniform(0, 2 * np.pi)
         
         # Physical properties
         self.length = np.random.uniform(*config.SPOROZOITE_LENGTH_RANGE)
@@ -77,263 +220,515 @@ class SporozoiteCenterlineArc:
         self.motility = np.random.uniform(*config.MOTILITY_RANGE)
         self.propulsion_strength = config.PROPULSIVE_FORCE_AMPLITUDE * self.motility
         
-        # Initialize centerline arc nodes
-        self.nodes = self._create_centerline_arc_nodes(initial_center)
-        self.num_nodes = len(self.nodes)
+        # Arc geometry - 90 degrees of a circle
+        self.arc_angle = np.pi / 2  # 90 degrees
+        self.radius_of_curvature = self.length / self.arc_angle  # Path radius equals curvature radius
+        self.num_nodes = config.CENTERLINE_SEGMENTS + 1
         
-        # Store rest curvature for bending forces
-        self.rest_curvature = self._calculate_initial_curvature()
+        # Circle parameters for this rod's path (each rod has unique circle)
+        self.circle_center = initial_center[:2].copy()  # XY center for circular path
+        self.z_position = initial_center[2]  # Fixed Z
         
-        # LJ force parameters
-        self.lj_strength = 0.1  # 1 from C code
-        self.interaction_width = 0.3  # WIDTH parameter from C code
+        # Current position along the circle (angle parameter)
+        self.current_angle = np.random.uniform(0, 2 * np.pi)  # Random start position
+        
+        # Speed of movement along the circle
+        self.speed = 1.2 * self.motility  # Different speeds per rod
+        
+        # NEW: Force-driven motion parameters
+        self.mass = 1.0  # Unit mass for each sporozoite
+        self.center_velocity = np.zeros(2)  # Velocity of circle center (XY only)
+        self.arc_constraint_stiffness = 500.0  # Stiffness to maintain arc shape
+        self.center_damping = 0.5  # Damping for center movement
+        
+        # Create centerline nodes (for physics)
+        self.nodes = self._create_arc_nodes()
+        
+        # Create 3D mesh body around centerline
+        self._create_mesh_body()
+        
+        # Time tracking
+        self.time = 0.0
     
-    def _calculate_initial_curvature(self) -> List[np.ndarray]:
-        """Calculate and store the initial curvature at each node for rest state"""
-        rest_curvature = []
-        
-        for i in range(len(self.nodes)):
-            if i == 0 or i == len(self.nodes) - 1:
-                # End nodes have zero curvature
-                rest_curvature.append(np.zeros(3))
-            else:
-                # Calculate initial curvature (second derivative)
-                prev_pos = self.nodes[i - 1].position
-                curr_pos = self.nodes[i].position
-                next_pos = self.nodes[i + 1].position
-                
-                curvature_vec = prev_pos - 2 * curr_pos + next_pos
-                rest_curvature.append(curvature_vec.copy())
-        
-        return rest_curvature
-    
-    def _create_centerline_arc_nodes(self, center: np.ndarray) -> List[CenterlineArcNode]:
-        """Create nodes along centerline with 90-degree arc curvature to match circular propulsion"""
+    def _create_arc_nodes(self) -> List[CenterlineArcNode]:
+        """Create nodes positioned as a 90-degree arc (for physics calculations)"""
         nodes = []
-        num_nodes = self.config.CENTERLINE_SEGMENTS + 1
         
-        # Create 90-degree arc shape to match circular propulsion
-        # The rod curves through 90 degrees (π/2 radians) from head to tail
-        arc_angle = np.pi / 2  # 90 degrees in radians
-        
-        # Calculate radius of curvature based on sporozoite length
-        # For a 90-degree arc: arc_length = radius * angle
-        # So: radius = arc_length / angle = length / (π/2)
-        radius_of_curvature = self.length / arc_angle
-        
-        for i in range(num_nodes):
-            # Parameter along centerline (0 to 1)
-            t = i / (num_nodes - 1)
+        for i in range(self.num_nodes):
+            # Parameter along the 90-degree arc (0 to 1)
+            t = i / (self.num_nodes - 1)
             
-            # Angle along the 90-degree arc (from -π/4 to +π/4 for symmetry)
-            # This centers the arc so the middle node is at the "center" of the curve
-            theta = (t - 0.5) * arc_angle  # Ranges from -π/4 to +π/4
+            # Angle within the 90-degree arc (-45° to +45° relative to current direction)
+            local_angle = (t - 0.5) * self.arc_angle
             
-            # Position along the 90-degree arc
-            # Use parametric circle equations
-            x_offset = radius_of_curvature * np.sin(theta)
-            y_offset = radius_of_curvature * (1.0 - np.cos(theta))  # Offset so arc starts at origin
-            z_offset = 0.0
+            # Position of this node on the circle
+            node_angle = self.current_angle + local_angle
             
-            # Center the arc around the origin
-            y_offset -= radius_of_curvature * (1.0 - np.cos(-arc_angle/2))  # Adjust for centering
+            # Calculate node position on the circular path
+            x = self.circle_center[0] + self.radius_of_curvature * np.cos(node_angle)
+            y = self.circle_center[1] + self.radius_of_curvature * np.sin(node_angle)
+            z = self.z_position
             
-            # Apply initial rotation around Z-axis
-            cos_dir = np.cos(self.direction)
-            sin_dir = np.sin(self.direction)
-            
-            rotated_x = x_offset * cos_dir - y_offset * sin_dir
-            rotated_y = x_offset * sin_dir + y_offset * cos_dir
-            
-            position = center + np.array([rotated_x, rotated_y, z_offset])
+            position = np.array([x, y, z])
             nodes.append(CenterlineArcNode(position, i))
         
         return nodes
     
+    def _create_mesh_body(self):
+        """Create 3D mesh body around the centerline arc - DIRECTLY USING CENTERLINE NODES"""
+        try:
+            # Instead of using SimpleSporozoiteMeshGeometry, build mesh directly around centerline nodes
+            self._build_mesh_around_centerline()
+            
+        except Exception as e:
+            print(f"  Warning: Could not create mesh for sporozoite {self.id}: {e}")
+            # Fallback: no mesh, just centerline
+            self.mesh_vertices = None
+            self.mesh_faces = None
+            self.original_relative_positions = None
+            self.simple_mesh = None
+    
+    def _build_mesh_around_centerline(self):
+        """Build mesh geometry directly around the actual centerline nodes"""
+        if len(self.nodes) < 2:
+            raise ValueError("Need at least 2 centerline nodes to create mesh")
+        
+        # Mesh parameters
+        n_radial = self.num_nodes  # Vertices per cross-section should match centreline nodes
+        
+        vertices = []
+        faces = []
+        
+        # Get centerline positions
+        spine_positions = np.array([node.position for node in self.nodes])
+        
+        # Calculate tangent vectors
+        tangents = []
+        for i in range(len(spine_positions)):
+            if i == 0:
+                tangent = spine_positions[i+1] - spine_positions[i] if len(spine_positions) > 1 else np.array([1, 0, 0])
+            elif i == len(spine_positions) - 1:
+                tangent = spine_positions[i] - spine_positions[i-1]
+            else:
+                tangent = spine_positions[i+1] - spine_positions[i-1]
+            
+            tangent_length = np.linalg.norm(tangent)
+            if tangent_length > 1e-8:
+                tangent = tangent / tangent_length
+            else:
+                tangent = np.array([1, 0, 0])
+            
+            tangents.append(tangent)
+        
+        # Create cross-sections around each centerline node
+        for i, (spine_point, tangent) in enumerate(zip(spine_positions, tangents)):
+            # Local coordinate system
+            if abs(tangent[2]) < 0.9:
+                normal = np.cross(tangent, np.array([0, 0, 1]))
+            else:
+                normal = np.cross(tangent, np.array([1, 0, 0]))
+            
+            normal_length = np.linalg.norm(normal)
+            if normal_length > 1e-8:
+                normal = normal / normal_length
+            else:
+                normal = np.array([0, 1, 0])
+            
+            binormal = np.cross(tangent, normal)
+            binormal_length = np.linalg.norm(binormal)
+            if binormal_length > 1e-8:
+                binormal = binormal / binormal_length
+            else:
+                binormal = np.array([0, 0, 1])
+            
+            # Radius varies along length (tapered ends)
+            t = i / (len(spine_positions) - 1) if len(spine_positions) > 1 else 0.5
+            radius_factor = np.sin(np.pi * t)
+            radius_factor = max(0.1, radius_factor)
+            radius = self.diameter/2 * radius_factor
+            
+            # Create circular cross-section
+            for j in range(n_radial):
+                angle = 2 * np.pi * j / n_radial
+                local_offset = (normal * np.cos(angle) + binormal * np.sin(angle)) * radius
+                vertex = spine_point + local_offset
+                vertices.append(vertex)
+        
+        # Create faces connecting cross-sections
+        for i in range(len(spine_positions) - 1):
+            for j in range(n_radial):
+                curr_ring = i * n_radial
+                next_ring = (i + 1) * n_radial
+                curr_j = j
+                next_j = (j + 1) % n_radial
+                
+                # Two triangles per quad
+                v1 = curr_ring + curr_j
+                v2 = curr_ring + next_j
+                v3 = next_ring + next_j
+                v4 = next_ring + curr_j
+                
+                faces.append([v1, v2, v3])
+                faces.append([v1, v3, v4])
+        
+        # Store results
+        self.mesh_vertices = np.array(vertices)
+        self.mesh_faces = np.array(faces)
+        self.n_radial = n_radial  # Store for visualization
+        
+        #print(f"  Created mesh: {len(self.mesh_vertices)} vertices, {len(self.mesh_faces)} faces around {len(self.nodes)} centerline nodes")
+
+    def _update_mesh_positions(self):
+        """Update mesh to follow centerline nodes - REBUILD from scratch each time"""
+        if self.mesh_vertices is None or len(self.nodes) == 0:
+            return
+        
+        # Simply rebuild the entire mesh around current centerline positions
+        self._build_mesh_around_centerline()
+    
+    def update_motion(self, dt: float, domain_size: Tuple[float, float, float]):
+        """Move the arc forward along its circular path with LJ force modifications"""
+        # Update time
+        self.time += dt
+        
+        # NEW: Use force-driven approach with arc constraints
+        self.update_motion_force_driven_with_constraints(dt)
+        
+        # Apply boundary conditions to circle center
+        self._apply_boundary_conditions(domain_size)
+        
+        # Update viability
+        self.viability -= self.config.VIABILITY_DECAY_RATE * dt
+    
+    def update_motion_force_driven_with_constraints(self, dt: float):
+        """Force-driven motion that maintains circular gliding characteristics while allowing path adaptation"""
+        # 1. Calculate collective force on the entire rod (for center movement)
+        total_external_force = np.zeros(3)
+        for node in self.nodes:
+            total_external_force += node.force
+        
+        center_of_mass_force = total_external_force / len(self.nodes)
+        
+        # 2. Move the circle center based on collective forces (XY only)
+        # This allows the entire circular path to translate dynamically
+        center_acceleration = center_of_mass_force[:2] / self.mass
+        
+        # Apply damping to prevent oscillations
+        self.center_velocity *= (1.0 - self.center_damping * dt)
+        self.center_velocity += center_acceleration * dt
+        
+        # Update circle center position
+        self.circle_center += self.center_velocity * dt
+        
+        # 3. Continue kinematic motion along the (possibly moved) circular path
+        self.current_angle += self.speed * dt
+        self.current_angle = self.current_angle % (2 * np.pi)
+        
+        # 4. Update each node with constraint forces to maintain arc shape
+        for i, node in enumerate(self.nodes):
+            # Calculate ideal position on the circular arc
+            t = i / (self.num_nodes - 1)
+            local_angle = (t - 0.5) * self.arc_angle
+            node_angle = self.current_angle + local_angle
+            
+            ideal_position = np.array([
+                self.circle_center[0] + self.radius_of_curvature * np.cos(node_angle),
+                self.circle_center[1] + self.radius_of_curvature * np.sin(node_angle),
+                self.z_position
+            ])
+            
+            # Calculate constraint force to maintain arc shape
+            position_error = node.position - ideal_position
+            constraint_force = -self.arc_constraint_stiffness * position_error
+            
+            # Total force: external LJ forces + arc constraint forces
+            total_node_force = node.force + constraint_force
+            
+            # Update node with force-based motion
+            node_acceleration = total_node_force / self.mass
+            node.velocity += node_acceleration * dt
+            node.position += node.velocity * dt
+            
+            # Calculate ideal kinematic velocity for reference
+            ideal_vx = -self.radius_of_curvature * self.speed * np.sin(node_angle) + self.center_velocity[0]
+            ideal_vy = self.radius_of_curvature * self.speed * np.cos(node_angle) + self.center_velocity[1]
+            ideal_vz = 0.0
+            ideal_velocity = np.array([ideal_vx, ideal_vy, ideal_vz])
+            
+            # Blend actual velocity toward ideal kinematic velocity (optional damping)
+            velocity_damping = 0.1  # Small damping to prevent excessive deviation
+            node.velocity = (1.0 - velocity_damping) * node.velocity + velocity_damping * ideal_velocity
+        
+        # Update mesh positions to match new node positions
+        self._update_mesh_positions()
+    
+    def _update_node_positions_with_forces(self, dt: float):
+        """Update node positions with kinematic motion + LJ force perturbations"""
+        # First, calculate ideal kinematic positions
+        ideal_positions = []
+        for i, node in enumerate(self.nodes):
+            # Parameter along the 90-degree arc (0 to 1)
+            t = i / (self.num_nodes - 1)
+            
+            # Angle within the 90-degree arc (-45° to +45° relative to current direction)
+            local_angle = (t - 0.5) * self.arc_angle
+            
+            # Position of this node on the circle
+            node_angle = self.current_angle + local_angle
+            
+            # Calculate ideal kinematic position
+            x = self.circle_center[0] + self.radius_of_curvature * np.cos(node_angle)
+            y = self.circle_center[1] + self.radius_of_curvature * np.sin(node_angle)
+            z = self.z_position
+            
+            ideal_position = np.array([x, y, z])
+            ideal_positions.append(ideal_position)
+            
+            # Calculate kinematic velocity (tangent to circle)
+            vx = -self.radius_of_curvature * self.speed * np.sin(node_angle)
+            vy = self.radius_of_curvature * self.speed * np.cos(node_angle)
+            vz = 0.0
+            
+            kinematic_velocity = np.array([vx, vy, vz])
+            
+            # Apply LJ force perturbation to position
+            # Use simple Euler integration: v = v_kinematic + F*dt/mass, x = x + v*dt
+            mass = 1.0  # Unit mass
+            force_acceleration = node.force / mass
+            
+            # Update velocity: combine kinematic motion with force-induced motion
+            node.velocity = kinematic_velocity + force_acceleration * dt
+            
+            # Update position: ideal kinematic position + small force-based displacement
+            force_displacement = force_acceleration * dt * dt  # Simple integration
+            
+            # Limit the force displacement to prevent instability
+            max_displacement = self.diameter / 4  # Max displacement per timestep
+            displacement_magnitude = np.linalg.norm(force_displacement)
+            if displacement_magnitude > max_displacement:
+                force_displacement = force_displacement * (max_displacement / displacement_magnitude)
+            
+            # Final position: kinematic + force perturbation
+            node.position = ideal_position + force_displacement
+        
+        # Update mesh positions to match new node positions
+        self._update_mesh_positions()
+    
+    def _update_node_positions(self):
+        """Original kinematic-only node position update (kept for compatibility)"""
+        for i, node in enumerate(self.nodes):
+            # Parameter along the 90-degree arc (0 to 1)
+            t = i / (self.num_nodes - 1)
+            
+            # Angle within the 90-degree arc (-45° to +45° relative to current direction)
+            local_angle = (t - 0.5) * self.arc_angle
+            
+            # Position of this node on the circle
+            node_angle = self.current_angle + local_angle
+            
+            # Calculate new node position
+            x = self.circle_center[0] + self.radius_of_curvature * np.cos(node_angle)
+            y = self.circle_center[1] + self.radius_of_curvature * np.sin(node_angle)
+            z = self.z_position
+            
+            node.position = np.array([x, y, z])
+            
+            # Calculate velocity (tangent to circle)
+            vx = -self.radius_of_curvature * self.speed * np.sin(node_angle)
+            vy = self.radius_of_curvature * self.speed * np.cos(node_angle)
+            vz = 0.0
+            
+            node.velocity = np.array([vx, vy, vz])
+            node.force.fill(0.0)  # No forces in this simple model
+        
+        # Update mesh positions to match new node positions
+        self._update_mesh_positions()
+    
+    def _apply_boundary_conditions(self, domain_size: Tuple[float, float, float]):
+        """Keep circle center within domain bounds"""
+        for dim in range(2):  # Only XY
+            if self.circle_center[dim] < self.radius_of_curvature:
+                self.circle_center[dim] = self.radius_of_curvature
+            elif self.circle_center[dim] > domain_size[dim] - self.radius_of_curvature:
+                self.circle_center[dim] = domain_size[dim] - self.radius_of_curvature
+    
     def get_center_position(self) -> np.ndarray:
-        """Get center position of the sporozoite"""
-        positions = np.array([node.position for node in self.nodes])
-        return np.mean(positions, axis=0)
+        """Get center position of the arc (head node position)"""
+        return self.nodes[0].position.copy()
     
     def calculate_lj_forces(self, other_sporozoites: List['SporozoiteCenterlineArc']):
-        """Calculate Lennard-Jones forces between nodes of different sporozoites"""
-        # Reset forces
+        """Calculate Lennard-Jones repulsion forces between this sporozoite's nodes and other sporozoites"""
+        # Clear forces first
         for node in self.nodes:
             node.force.fill(0.0)
         
-        # Calculate LJ forces with other sporozoites
+        # Calculate repulsion with other sporozoites
         for other in other_sporozoites:
             if other.id == self.id:
-                continue
-                
+                continue  # Skip self
+            
+            # Node-to-node LJ repulsion
             for my_node in self.nodes:
                 for other_node in other.nodes:
-                    distance_vec = my_node.position - other_node.position
-                    distance = np.linalg.norm(distance_vec)
+                    # Calculate distance between nodes
+                    r_vec = my_node.position - other_node.position
+                    r_distance = np.linalg.norm(r_vec)
                     
-                    if distance < my_node.cutoff_distance and distance > 1e-8:
-                        # LJ force calculation (from C code)
-                        sig2 = (2**(1/3) - (2*self.interaction_width)**2)
-                        
-                        # LJ force magnitude
-                        lj_force_mag = self.lj_strength * distance * (
-                            2 / (distance**2 + sig2)**7 - 
-                            1 / (distance**2 + sig2)**4
-                        )
-                        
-                        # Force direction (repulsive/attractive)
-                        force_direction = distance_vec / distance
-                        lj_force = lj_force_mag * force_direction
-                        
-                        my_node.force += lj_force
+                    # Skip if too far (beyond cutoff)
+                    if r_distance > my_node.cutoff_distance:
+                        continue
+                    
+                    # Skip if too close (avoid singularity)
+                    if r_distance < 0.01:
+                        continue
+                    
+                    # Effective radius - use diameter as repulsion distance
+                    # Strong repulsion when nodes are within combined radius
+                    effective_radius = (self.diameter + other.diameter) / 2
+                    
+                    # Pure repulsion LJ potential (only repulsive part)
+                    # F = 12 * epsilon * ((sigma/r)^13 - (sigma/r)^7) * (1/r)
+                    # But we want strong repulsion at effective_radius, so use effective_radius as sigma
+                    
+                    sigma_eff = effective_radius
+                    epsilon_eff = my_node.epsilon
+                    
+                    # Normalized distance
+                    sigma_over_r = sigma_eff / r_distance
+                    sigma_over_r_6 = sigma_over_r ** 6
+                    sigma_over_r_12 = sigma_over_r_6 ** 2
+                    
+                    # LJ force magnitude (repulsive only)
+                    # We only use the repulsive part: F = 12*eps*(sigma/r)^12/r - 6*eps*(sigma/r)^6/r
+                    # But since we want pure repulsion, we can modify this to be stronger
+                    force_magnitude = 12.0 * epsilon_eff * (sigma_over_r_12 - 0.5 * sigma_over_r_6) / r_distance
+                    
+                    # Direction (away from other node)
+                    if r_distance > 1e-10:
+                        force_direction = r_vec / r_distance
+                    else:
+                        # Random direction if nodes are exactly overlapping
+                        force_direction = np.random.randn(3)
+                        force_direction = force_direction / np.linalg.norm(force_direction)
+                    
+                    # Apply force to this node
+                    repulsion_force = force_magnitude * force_direction
+                    my_node.force += repulsion_force
     
     def calculate_internal_forces(self):
-        """Calculate internal forces: stretching, bending, and propulsion"""
-        
-        # Stretching forces (spring connections between adjacent nodes)
-        rest_length = self.length / (self.num_nodes - 1)
-        spring_constant = self.config.STRETCH_STIFFNESS
-        
-        for i in range(len(self.nodes) - 1):
-            current_node = self.nodes[i]
-            next_node = self.nodes[i + 1]
-            
-            # Spring vector and length
-            spring_vec = next_node.position - current_node.position
-            current_length = np.linalg.norm(spring_vec)
-            
-            if current_length > 1e-8:
-                # Spring force
-                force_magnitude = spring_constant * (current_length - rest_length)
-                force_direction = spring_vec / current_length
-                spring_force = force_magnitude * force_direction
-                
-                # Apply equal and opposite forces
-                current_node.force += spring_force
-                next_node.force -= spring_force
-        
-        # Bending forces (maintain rest curvature)
-        bending_stiffness = self.config.BENDING_STIFFNESS
-        
-        for i in range(1, len(self.nodes) - 1):
-            prev_node = self.nodes[i - 1]
-            current_node = self.nodes[i]
-            next_node = self.nodes[i + 1]
-            
-            # Current curvature
-            current_curvature = (prev_node.position - 2 * current_node.position + next_node.position)
-            
-            # Desired rest curvature
-            rest_curvature_vec = self.rest_curvature[i]
-            
-            # Bending force tries to restore rest curvature
-            curvature_deviation = current_curvature - rest_curvature_vec
-            bending_force = -bending_stiffness * curvature_deviation
-            
-            # Apply bending forces to the three nodes involved
-            # The force distribution follows the second derivative pattern
-            prev_node.force += bending_force
-            current_node.force -= 2 * bending_force
-            next_node.force += bending_force
-        
-        # Propulsion forces along centerline direction
-        self._apply_propulsion_forces()
-    
-    def _apply_propulsion_forces(self):
-        """Apply LJ-based propulsion forces along the centerline with circular rotation"""
-        if len(self.nodes) < 2:
-            return
-        
-        for i, node in enumerate(self.nodes):
-            # Calculate local centerline direction
-            if i == 0:
-                # Head node - direction from current to next
-                direction_vec = self.nodes[i + 1].position - node.position
-            elif i == len(self.nodes) - 1:
-                # Tail node - direction from previous to current
-                direction_vec = node.position - self.nodes[i - 1].position
-            else:
-                # Middle nodes - average direction
-                forward_vec = self.nodes[i + 1].position - node.position
-                backward_vec = node.position - self.nodes[i - 1].position
-                direction_vec = (forward_vec + backward_vec) / 2
-            
-            # Normalize direction
-            if np.linalg.norm(direction_vec) > 1e-8:
-                direction_vec = direction_vec / np.linalg.norm(direction_vec)
-            
-            # Propulsion strength varies along centerline (stronger at head)
-            t = i / max(1, len(self.nodes) - 1)
-            propulsion_factor = 1.0 - 0.5 * t  # Stronger at head (t=0)
-            
-            # Calculate linear propulsion force (existing)
-            linear_propulsion_force = (self.propulsion_strength * propulsion_factor * 
-                                     self.motility * direction_vec)
-            
-            # Apply 90-degree counterclockwise rotation matrix to create circular motion
-            # Rotation matrix for 90 degrees CCW in 2D: [0 -1; 1 0]
-            # For 3D: rotate in the XY plane, keep Z component unchanged
-            circular_propulsion_force = np.zeros(3)
-            circular_propulsion_force[0] = -linear_propulsion_force[1]  # -fy
-            circular_propulsion_force[1] = linear_propulsion_force[0]   # fx
-            circular_propulsion_force[2] = linear_propulsion_force[2]   # unchanged Z
-            
-            # Combine linear and circular components with adjustable weights
-            linear_weight = 0.0      # 30% linear (forward) motion
-            circular_weight = 0.7    # 70% circular (rotational) motion
-            
-            combined_propulsion_force = (linear_weight * linear_propulsion_force + 
-                                       circular_weight * circular_propulsion_force)
-            
-            # Apply the combined propulsion force
-            node.force += combined_propulsion_force
-    
-    def update_motion(self, dt: float, domain_size: Tuple[float, float, float]):
-        """Update node positions using forces and physics"""
-        damping = self.config.CENTERLINE_DAMPING
-        
-        for node in self.nodes:
-            # Add random thermal forces
-            thermal_force = np.random.normal(0, self.config.NOISE_STRENGTH, 3)
-            node.force += thermal_force
-            
-            # Update velocity with damping
-            node.velocity *= (1.0 - damping * dt)
-            node.velocity += node.force * dt  # Assume unit mass
-            
-            # Update position
-            node.position += node.velocity * dt
-            
-            # Apply boundary conditions
-            self._apply_boundary_conditions(node, domain_size)
-        
-        # Update sporozoite properties
-        self.viability -= self.config.VIABILITY_DECAY_RATE * dt
-        self.undulation_phase += 2 * np.pi * dt
-    
-    def _apply_boundary_conditions(self, node: CenterlineArcNode, 
-                                 domain_size: Tuple[float, float, float]):
-        """Apply boundary conditions to keep nodes within domain"""
-        boundary_stiffness = self.config.BOUNDARY_REPULSION_STRENGTH
-        
-        for dim in range(3):
-            if node.position[dim] < 0:
-                # Repulsive force from lower boundary
-                penetration = -node.position[dim]
-                node.force[dim] += boundary_stiffness * penetration
-                node.position[dim] = max(0.1, node.position[dim])
-            elif node.position[dim] > domain_size[dim]:
-                # Repulsive force from upper boundary
-                penetration = node.position[dim] - domain_size[dim]
-                node.force[dim] -= boundary_stiffness * penetration
-                node.position[dim] = min(domain_size[dim] - 0.1, node.position[dim])
+        """No internal forces - motion is purely kinematic"""
+        pass
     
     def is_viable(self) -> bool:
         """Check if sporozoite is still viable"""
         return self.viability > 0.1
 
     def to_vtk_polydata(self) -> vtk.vtkPolyData:
-        """Convert sporozoite centerline arc to VTK PolyData for visualization"""
+        """Convert sporozoite to VTK PolyData - includes both centerline and 3D mesh body"""
+        
+        # If we have a 3D mesh body, create a mesh polydata
+        if self.mesh_vertices is not None and self.mesh_faces is not None:
+            return self._create_mesh_polydata()
+        else:
+            # Fallback to centerline representation
+            return self._create_centerline_polydata()
+    
+    def _create_mesh_polydata(self) -> vtk.vtkPolyData:
+        """Create VTK polydata for the 3D mesh body WITH proper centerline lines"""
+        polydata = vtk.vtkPolyData()
+        
+        # Add ALL points: mesh vertices + actual centerline node positions
+        points = vtk.vtkPoints()
+        
+        # First add mesh vertices
+        for vertex in self.mesh_vertices:
+            points.InsertNextPoint(vertex[0], vertex[1], vertex[2])
+        
+        # Then add actual centerline node positions as separate points
+        centerline_start_idx = len(self.mesh_vertices)
+        for node in self.nodes:
+            points.InsertNextPoint(node.position[0], node.position[1], node.position[2])
+        
+        polydata.SetPoints(points)
+        
+        # Add mesh faces as polygons
+        polys = vtk.vtkCellArray()
+        valid_faces = 0
+        
+        for face in self.mesh_faces:
+            # Validate face indices
+            valid_face = True
+            for vertex_id in face:
+                if vertex_id < 0 or vertex_id >= len(self.mesh_vertices):
+                    valid_face = False
+                    break
+            
+            if valid_face and len(face) >= 3:
+                # Create polygon
+                poly = vtk.vtkPolygon()
+                poly.GetPointIds().SetNumberOfIds(len(face))
+                for i, vertex_id in enumerate(face):
+                    poly.GetPointIds().SetId(i, int(vertex_id))
+                polys.InsertNextCell(poly)
+                valid_faces += 1
+        
+        polydata.SetPolys(polys)
+        
+        # Add PROPER centerline lines using the actual centerline node points
+        lines = vtk.vtkCellArray()
+        for i in range(len(self.nodes) - 1):
+            line = vtk.vtkLine()
+            line.GetPointIds().SetId(0, centerline_start_idx + i)
+            line.GetPointIds().SetId(1, centerline_start_idx + i + 1)
+            lines.InsertNextCell(line)
+        polydata.SetLines(lines)
+        
+        # Add scalar data arrays (uniform across ALL points: mesh + centerline)
+        total_points = len(self.mesh_vertices) + len(self.nodes)
+        
+        # Viability (primary scalar for coloring)
+        viability_array = vtk.vtkFloatArray()
+        viability_array.SetName("Viability")
+        viability_array.SetNumberOfTuples(total_points)
+        for i in range(total_points):
+            viability_array.SetValue(i, float(self.viability))
+        polydata.GetPointData().SetScalars(viability_array)
+        
+        # Motility
+        motility_array = vtk.vtkFloatArray()
+        motility_array.SetName("Motility")
+        motility_array.SetNumberOfTuples(total_points)
+        for i in range(total_points):
+            motility_array.SetValue(i, float(self.motility))
+        polydata.GetPointData().AddArray(motility_array)
+        
+        # Sporozoite ID
+        id_array = vtk.vtkIntArray()
+        id_array.SetName("SporozoiteID")
+        id_array.SetNumberOfTuples(total_points)
+        for i in range(total_points):
+            id_array.SetValue(i, int(self.id))
+        polydata.GetPointData().AddArray(id_array)
+        
+        # Length and diameter
+        length_array = vtk.vtkFloatArray()
+        length_array.SetName("Length")
+        length_array.SetNumberOfTuples(total_points)
+        for i in range(total_points):
+            length_array.SetValue(i, float(self.length))
+        polydata.GetPointData().AddArray(length_array)
+        
+        diameter_array = vtk.vtkFloatArray()
+        diameter_array.SetName("Diameter")
+        diameter_array.SetNumberOfTuples(total_points)
+        for i in range(total_points):
+            diameter_array.SetValue(i, float(self.diameter))
+        polydata.GetPointData().AddArray(diameter_array)
+        
+        return polydata
+    
+    def _create_centerline_polydata(self) -> vtk.vtkPolyData:
+        """Create VTK polydata for centerline (fallback if mesh creation failed)"""
         polydata = vtk.vtkPolyData()
         
         # Create points from nodes
@@ -380,41 +775,6 @@ class SporozoiteCenterlineArc:
                                    float(node.velocity[2]))
         polydata.GetPointData().SetVectors(velocity_array)
         
-        # Node forces (vector)
-        force_array = vtk.vtkFloatArray()
-        force_array.SetName("Force")
-        force_array.SetNumberOfComponents(3)
-        force_array.SetNumberOfTuples(len(self.nodes))
-        for i, node in enumerate(self.nodes):
-            force_array.SetTuple3(i,
-                                float(node.force[0]),
-                                float(node.force[1]),
-                                float(node.force[2]))
-        polydata.GetPointData().AddArray(force_array)
-        
-        # Sporozoite properties (constant across all nodes)
-        length_array = vtk.vtkFloatArray()
-        length_array.SetName("Length")
-        length_array.SetNumberOfTuples(len(self.nodes))
-        for i in range(len(self.nodes)):
-            length_array.SetValue(i, float(self.length))
-        polydata.GetPointData().AddArray(length_array)
-        
-        diameter_array = vtk.vtkFloatArray()
-        diameter_array.SetName("Diameter")
-        diameter_array.SetNumberOfTuples(len(self.nodes))
-        for i in range(len(self.nodes)):
-            diameter_array.SetValue(i, float(self.diameter))
-        polydata.GetPointData().AddArray(diameter_array)
-        
-        # Propulsion strength
-        propulsion_array = vtk.vtkFloatArray()
-        propulsion_array.SetName("PropulsionStrength")
-        propulsion_array.SetNumberOfTuples(len(self.nodes))
-        for i in range(len(self.nodes)):
-            propulsion_array.SetValue(i, float(self.propulsion_strength))
-        polydata.GetPointData().AddArray(propulsion_array)
-        
         return polydata
 
 
@@ -434,6 +794,9 @@ class SalivaryGlandLJSimulation:
         self.sporozoites: List[SporozoiteCenterlineArc] = []
         self._initialize_sporozoites()
         
+        # Calculate volume fraction for output directory naming
+        self.volume_fraction = self._calculate_volume_fraction()
+        
         # Simulation parameters
         self.time = 0.0
         self.dt = self.config.TIME_STEP
@@ -441,14 +804,39 @@ class SalivaryGlandLJSimulation:
         self.output_interval = self.config.OUTPUT_INTERVAL
         self.last_output_time = 0.0
         
-        # Output setup
+        # Output setup with volume fraction in name
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.output_dir = f"salivary_gland_lj_{timestamp}"
+        volume_fraction_str = f"{self.volume_fraction:.3f}".replace('.', 'p')  # Replace . with p for filename
+        self.output_dir = f"/Users/s2526994/Desktop/SporozoiteInfect/vtk_output/{volume_fraction_str}_circular_gliding_{timestamp}"
         os.makedirs(self.output_dir, exist_ok=True)
         
         print(f"Simulation initialized with {len(self.sporozoites)} sporozoites")
         print(f"Domain size: {domain_size}")
+        print(f"Volume fraction: {self.volume_fraction:.6f}")
         print(f"Output directory: {self.output_dir}")
+    
+    def _calculate_volume_fraction(self) -> float:
+        """Calculate the volume fraction of sporozoites in the domain"""
+        # Calculate domain volume
+        box_volume = self.domain_size[0] * self.domain_size[1] * self.domain_size[2]
+        
+        # Calculate total sporozoite volume
+        sporozoite_volume = 0.0
+        for sporozoite in self.sporozoites:
+            if sporozoite.mesh_vertices is not None and sporozoite.mesh_faces is not None:
+                # Simple approximation: cylinder volume = π * r² * h
+                radius = sporozoite.diameter / 2
+                length = sporozoite.length
+                cylinder_volume = np.pi * radius**2 * length
+                sporozoite_volume += cylinder_volume
+            else:
+                # Fallback calculation if mesh failed
+                radius = sporozoite.diameter / 2
+                length = sporozoite.length
+                cylinder_volume = np.pi * radius**2 * length
+                sporozoite_volume += cylinder_volume
+        
+        return sporozoite_volume / box_volume
     
     def _initialize_sporozoites(self):
         """Create initial sporozoites in salivary gland injection area"""
@@ -508,31 +896,72 @@ class SalivaryGlandLJSimulation:
         # Update sporozoite list
         self.sporozoites = active_sporozoites
     
+    def write_output(self, step_number: int):
+        """Write VTK files and state for current simulation step - WITH SEPARATE CENTERLINE TIME SERIES"""
+        # Write main sporozoite data (with bounding box included)
+        self._write_sporozoite_vtk(step_number)
+        
+        # Write separate centerline arc time series for comparison
+        self._write_centerline_arcs_vtk(step_number)
+        
+        # Initialize time series collection files (only once at the beginning)
+        if step_number == 0:
+            self._write_time_series_collection_files()
+        
+        # Update both collections
+        self._update_sporozoites_time_series_collection(step_number)
+        self._update_centerline_arcs_time_series_collection(step_number)
+        
+        # Write ParaView state file (only at the end)
+        if step_number == 0:
+            self._write_paraview_state_file()
+
     def _write_sporozoite_vtk(self, step_number: int):
         """Write sporozoite centerline arcs to VTK with proper time information for animation"""
         multiblock = vtk.vtkMultiBlockDataSet()
-        multiblock.SetNumberOfBlocks(len(self.sporozoites))
+        
+        # Calculate total number of blocks: sporozoites + their components + bounding box
+        total_blocks = len(self.sporozoites) * 3 + 1  # 3 components per sporozoite + bounding box
+        multiblock.SetNumberOfBlocks(total_blocks)
+        
+        block_index = 0
+        
+        # Add bounding box as first block
+        bbox_polydata = self._create_bounding_box_vtk()
+        multiblock.SetBlock(block_index, bbox_polydata)
+        multiblock.GetMetaData(block_index).Set(vtk.vtkCompositeDataSet.NAME(), "BoundingBox")
+        block_index += 1
         
         for i, sporozoite in enumerate(self.sporozoites):
-            # Convert sporozoite to VTK polydata
-            polydata = sporozoite.to_vtk_polydata()
+            # Create separate VTK components for this sporozoite
             
-            # Validate the polydata
-            if polydata.GetNumberOfPoints() == 0:
-                print(f"    ERROR: Sporozoite {sporozoite.id} has no points!")
-                continue
-            if polydata.GetNumberOfLines() == 0:
-                print(f"    WARNING: Sporozoite {sporozoite.id} has no lines!")
+            # 1. Mesh body (full polydata)
+            mesh_polydata = sporozoite.to_vtk_polydata()
+            if mesh_polydata.GetNumberOfPoints() > 0:
+                # Add time information
+                time_array = vtk.vtkDoubleArray()
+                time_array.SetName("TimeValue")
+                time_array.SetNumberOfTuples(1)
+                time_array.SetValue(0, self.time)
+                mesh_polydata.GetFieldData().AddArray(time_array)
+                
+                multiblock.SetBlock(block_index, mesh_polydata)
+                multiblock.GetMetaData(block_index).Set(vtk.vtkCompositeDataSet.NAME(), f"Sporozoite_{sporozoite.id}_Mesh")
+                block_index += 1
             
-            # Add time information to each block
-            time_array_block = vtk.vtkDoubleArray()
-            time_array_block.SetName("TimeValue")
-            time_array_block.SetNumberOfTuples(1)
-            time_array_block.SetValue(0, self.time)
-            polydata.GetFieldData().AddArray(time_array_block)
+            # 2. Center point
+            center_polydata = self._create_center_point_vtk(sporozoite)
+            multiblock.SetBlock(block_index, center_polydata)
+            multiblock.GetMetaData(block_index).Set(vtk.vtkCompositeDataSet.NAME(), f"Sporozoite_{sporozoite.id}_Center")
+            block_index += 1
             
-            multiblock.SetBlock(i, polydata)
-            multiblock.GetMetaData(i).Set(vtk.vtkCompositeDataSet.NAME(), f"Sporozoite_{sporozoite.id}")
+            # 3. Linear representation (centerline arc)
+            linear_polydata = self._create_centerline_arc_vtk(sporozoite)
+            multiblock.SetBlock(block_index, linear_polydata)
+            multiblock.GetMetaData(block_index).Set(vtk.vtkCompositeDataSet.NAME(), f"Sporozoite_{sporozoite.id}_Linear")
+            block_index += 1
+            
+            print(f"    Added sporozoite {sporozoite.id} with 3 components to multiblock")
         
         # Write to file with proper format settings
         filename = os.path.join(self.output_dir, f"sporozoites_{step_number:04d}.vtm")
@@ -544,132 +973,123 @@ class SalivaryGlandLJSimulation:
         writer.SetCompressorTypeToNone()  # Disable compression to avoid binary issues
         writer.Write()
         
-        print(f"VTK DEBUG: Successfully wrote {filename}")
-    
-    def _write_salivary_gland_environment_vtk(self, step_number: int):
-        """Write salivary gland environment field data to VTK"""
-        # Create a structured grid for the salivary gland environment
-        grid_resolution = (20, 20, 8)  # Reasonable resolution for visualization
+        print(f"VTK DEBUG: Successfully wrote {filename} with {block_index} blocks")
+
+    def _write_centerline_arcs_vtk(self, step_number: int):
+        """Write separate VTK file containing ONLY the centerline arcs for easy comparison"""
+        multiblock = vtk.vtkMultiBlockDataSet()
+        multiblock.SetNumberOfBlocks(len(self.sporozoites))
         
-        # Create coordinate arrays
-        x_coords = np.linspace(0, self.domain_size[0], grid_resolution[0])
-        y_coords = np.linspace(0, self.domain_size[1], grid_resolution[1])
-        z_coords = np.linspace(0, self.domain_size[2], grid_resolution[2])
+        for i, sporozoite in enumerate(self.sporozoites):
+            # Create pure centerline arc polydata
+            centerline_polydata = vtk.vtkPolyData()
+            
+            # Add centerline node points
+            points = vtk.vtkPoints()
+            for node in sporozoite.nodes:
+                points.InsertNextPoint(node.position[0], node.position[1], node.position[2])
+            centerline_polydata.SetPoints(points)
+            
+            # Create lines connecting the nodes
+            lines = vtk.vtkCellArray()
+            for j in range(len(sporozoite.nodes) - 1):
+                line = vtk.vtkLine()
+                line.GetPointIds().SetId(0, j)
+                line.GetPointIds().SetId(1, j + 1)
+                lines.InsertNextCell(line)
+            centerline_polydata.SetLines(lines)
+            
+            # Add time information
+            time_array = vtk.vtkDoubleArray()
+            time_array.SetName("TimeValue")
+            time_array.SetNumberOfTuples(1)
+            time_array.SetValue(0, self.time)
+            centerline_polydata.GetFieldData().AddArray(time_array)
+            
+            # Add sporozoite properties for all nodes
+            num_nodes = len(sporozoite.nodes)
+            
+            # Viability (primary scalar for coloring)
+            viability_array = vtk.vtkFloatArray()
+            viability_array.SetName("Viability")
+            viability_array.SetNumberOfTuples(num_nodes)
+            for k in range(num_nodes):
+                viability_array.SetValue(k, float(sporozoite.viability))
+            centerline_polydata.GetPointData().SetScalars(viability_array)
+            
+            # Sporozoite ID
+            id_array = vtk.vtkIntArray()
+            id_array.SetName("SporozoiteID")
+            id_array.SetNumberOfTuples(num_nodes)
+            for k in range(num_nodes):
+                id_array.SetValue(k, int(sporozoite.id))
+            centerline_polydata.GetPointData().AddArray(id_array)
+            
+            # Node positions as individual components (for detailed analysis)
+            x_pos_array = vtk.vtkFloatArray()
+            x_pos_array.SetName("NodePositionX")
+            x_pos_array.SetNumberOfTuples(num_nodes)
+            y_pos_array = vtk.vtkFloatArray()
+            y_pos_array.SetName("NodePositionY")
+            y_pos_array.SetNumberOfTuples(num_nodes)
+            z_pos_array = vtk.vtkFloatArray()
+            z_pos_array.SetName("NodePositionZ")
+            z_pos_array.SetNumberOfTuples(num_nodes)
+            
+            for k, node in enumerate(sporozoite.nodes):
+                x_pos_array.SetValue(k, float(node.position[0]))
+                y_pos_array.SetValue(k, float(node.position[1]))
+                z_pos_array.SetValue(k, float(node.position[2]))
+            
+            centerline_polydata.GetPointData().AddArray(x_pos_array)
+            centerline_polydata.GetPointData().AddArray(y_pos_array)
+            centerline_polydata.GetPointData().AddArray(z_pos_array)
+            
+            # Node velocities as vectors
+            velocity_array = vtk.vtkFloatArray()
+            velocity_array.SetName("NodeVelocity")
+            velocity_array.SetNumberOfComponents(3)
+            velocity_array.SetNumberOfTuples(num_nodes)
+            for k, node in enumerate(sporozoite.nodes):
+                velocity_array.SetTuple3(k, 
+                                       float(node.velocity[0]),
+                                       float(node.velocity[1]), 
+                                       float(node.velocity[2]))
+            centerline_polydata.GetPointData().SetVectors(velocity_array)
+            
+            # Arc geometry parameters for verification
+            arc_radius_array = vtk.vtkFloatArray()
+            arc_radius_array.SetName("ArcRadius")
+            arc_radius_array.SetNumberOfTuples(num_nodes)
+            arc_angle_array = vtk.vtkFloatArray()
+            arc_angle_array.SetName("CurrentAngle")
+            arc_angle_array.SetNumberOfTuples(num_nodes)
+            
+            for k in range(num_nodes):
+                arc_radius_array.SetValue(k, float(sporozoite.radius_of_curvature))
+                arc_angle_array.SetValue(k, float(sporozoite.current_angle))
+            
+            centerline_polydata.GetPointData().AddArray(arc_radius_array)
+            centerline_polydata.GetPointData().AddArray(arc_angle_array)
+            
+            # Add to multiblock
+            multiblock.SetBlock(i, centerline_polydata)
+            multiblock.GetMetaData(i).Set(vtk.vtkCompositeDataSet.NAME(), f"CenterlineArc_{sporozoite.id}")
         
-        X, Y, Z = np.meshgrid(x_coords, y_coords, z_coords, indexing='ij')
+        # Write centerline arcs file
+        filename = os.path.join(self.output_dir, f"centerline_arcs_{step_number:04d}.vtm")
         
-        # Create VTK structured grid
-        grid = vtk.vtkStructuredGrid()
-        grid.SetDimensions(*grid_resolution)
-        
-        # Add time information
-        time_array = vtk.vtkDoubleArray()
-        time_array.SetName("TimeValue")
-        time_array.SetNumberOfTuples(1)
-        time_array.SetValue(0, self.time)
-        grid.GetFieldData().AddArray(time_array)
-        
-        # Add points
-        points = vtk.vtkPoints()
-        for k in range(grid_resolution[2]):
-            for j in range(grid_resolution[1]):
-                for i in range(grid_resolution[0]):
-                    points.InsertNextPoint(X[i,j,k], Y[i,j,k], Z[i,j,k])
-        grid.SetPoints(points)
-        
-        # Create salivary gland environment fields
-        # Density field (higher near injection site)
-        density_array = vtk.vtkFloatArray()
-        density_array.SetName("SalivaryGlandDensity")
-        density_array.SetNumberOfTuples(grid.GetNumberOfPoints())
-        
-        # Flow field (general downward flow in salivary gland)
-        flow_array = vtk.vtkFloatArray()
-        flow_array.SetName("FlowField")
-        flow_array.SetNumberOfComponents(3)
-        flow_array.SetNumberOfTuples(grid.GetNumberOfPoints())
-        
-        # Resistance field (higher resistance in dense regions)
-        resistance_array = vtk.vtkFloatArray()
-        resistance_array.SetName("Resistance")
-        resistance_array.SetNumberOfTuples(grid.GetNumberOfPoints())
-        
-        point_index = 0
-        for k in range(grid_resolution[2]):
-            for j in range(grid_resolution[1]):
-                for i in range(grid_resolution[0]):
-                    x, y, z = X[i,j,k], Y[i,j,k], Z[i,j,k]
-                    
-                    # Salivary gland density (higher near top - injection site)
-                    injection_z = self.domain_size[2] * 0.8
-                    z_factor = max(0, (z - injection_z/2) / (self.domain_size[2] - injection_z/2))
-                    
-                    # Add some radial variation
-                    center_x, center_y = self.domain_size[0]/2, self.domain_size[1]/2
-                    radial_dist = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-                    max_radial = min(self.domain_size[:2]) / 2
-                    radial_factor = 1.0 - (radial_dist / max_radial)**2
-                    
-                    density = z_factor * radial_factor * 0.8 + 0.2
-                    density_array.SetValue(point_index, float(density))
-                    
-                    # Flow field (downward with some swirl)
-                    flow_x = 0.1 * np.sin(2 * np.pi * y / self.domain_size[1])
-                    flow_y = 0.1 * np.cos(2 * np.pi * x / self.domain_size[0])
-                    flow_z = -2.0 * (1.0 - z / self.domain_size[2])  # Downward flow
-                    flow_array.SetTuple3(point_index, float(flow_x), float(flow_y), float(flow_z))
-                    
-                    # Resistance (inversely related to flow, higher in dense regions)
-                    resistance = density * 1.5 + 0.5
-                    resistance_array.SetValue(point_index, float(resistance))
-                    
-                    point_index += 1
-        
-        # Add arrays to grid
-        grid.GetPointData().SetScalars(density_array)
-        grid.GetPointData().SetVectors(flow_array)
-        grid.GetPointData().AddArray(resistance_array)
-        
-        # Write salivary gland environment field
-        filename = os.path.join(self.output_dir, f"salivary_gland_env_{step_number:04d}.vts")
-        writer = vtk.vtkXMLStructuredGridWriter()
+        writer = vtk.vtkXMLMultiBlockDataWriter()
         writer.SetFileName(filename)
-        writer.SetInputData(grid)
+        writer.SetInputData(multiblock)
         writer.SetDataModeToAscii()
         writer.SetCompressorTypeToNone()
         writer.Write()
-    
-    def _write_simulation_state(self, step_number: int):
-        """Write simulation state and statistics"""
-        filename = os.path.join(self.output_dir, f"state_{step_number:04d}.txt")
         
-        with open(filename, 'w') as f:
-            f.write(f"Salivary Gland LJ Simulation State - Step {step_number}\n")
-            f.write(f"Time: {self.time:.3f}s\n")
-            f.write(f"Active sporozoites: {len(self.sporozoites)}\n")
-            f.write(f"Domain size: {self.domain_size}\n")
-            f.write(f"Environment type: Salivary Gland\n")
-            f.write(f"Force model: Lennard-Jones with centerline arc nodes\n")
-            f.write(f"Centerline segments: {self.config.CENTERLINE_SEGMENTS}\n")
-            f.write(f"Propulsive force amplitude: {self.config.PROPULSIVE_FORCE_AMPLITUDE}\n")
-            
-            # Individual sporozoite data
-            f.write("\nSporozoite Details:\n")
-            for sporozoite in self.sporozoites:
-                center_pos = sporozoite.get_center_position()
-                x_pos = float(center_pos[0])
-                y_pos = float(center_pos[1])
-                z_pos = float(center_pos[2])
-                viability = float(sporozoite.viability)
-                motility = float(sporozoite.motility)
-                sporozoite_id = int(sporozoite.id)
-                
-                f.write(f"ID {sporozoite_id}: center=[{x_pos:.2f}, {y_pos:.2f}, {z_pos:.2f}], "
-                       f"viability={viability:.3f}, motility={motility:.3f}, "
-                       f"length={sporozoite.length:.2f}, nodes={sporozoite.num_nodes}\n")
-    
+        print(f"VTK DEBUG: Successfully wrote centerline arcs {filename} with {len(self.sporozoites)} arcs")
+
     def _write_time_series_collection_files(self):
-        """Write ParaView time series collection files for sporozoites and environment"""
+        """Write ParaView time series collection files for both sporozoites and centerline arcs"""
         # Create sporozoites time series collection file
         sporozoites_collection_file = os.path.join(self.output_dir, "sporozoites_timeseries.pvd")
         
@@ -681,25 +1101,25 @@ class SalivaryGlandLJSimulation:
             f.write('  </Collection>\n')
             f.write('</VTKFile>\n')
         
-        # Create salivary gland environment time series collection file
-        environment_collection_file = os.path.join(self.output_dir, "salivary_gland_env_timeseries.pvd")
+        # Create centerline arcs time series collection file
+        centerline_collection_file = os.path.join(self.output_dir, "centerline_arcs_timeseries.pvd")
         
-        with open(environment_collection_file, 'w') as f:
+        with open(centerline_collection_file, 'w') as f:
             f.write('<?xml version="1.0"?>\n')
             f.write('<VTKFile type="Collection" version="0.1">\n')
             f.write('  <Collection>\n')
-            f.write('    <!-- Salivary gland environment time series data will be added here -->\n')
+            f.write('    <!-- Centerline arc time series data will be added here -->\n')
             f.write('  </Collection>\n')
             f.write('</VTKFile>\n')
         
         # Store the collection file paths for updates
         self.sporozoites_collection_file_path = sporozoites_collection_file
-        self.environment_collection_file_path = environment_collection_file
+        self.centerline_collection_file_path = centerline_collection_file
         
         print(f"Created time series collection files:")
         print(f"  Sporozoites: {sporozoites_collection_file}")
-        print(f"  Environment: {environment_collection_file}")
-    
+        print(f"  Centerline Arcs: {centerline_collection_file}")
+
     def _update_sporozoites_time_series_collection(self, step_number: int):
         """Update the sporozoites time series collection file with new time step"""
         if not hasattr(self, 'sporozoites_collection_file_path'):
@@ -734,15 +1154,15 @@ class SalivaryGlandLJSimulation:
             for line in lines:
                 if '<!-- Sporozoite time series data will be added here -->' not in line:
                     f.write(line)
-    
-    def _update_environment_time_series_collection(self, step_number: int):
-        """Update the environment time series collection file with new time step"""
-        if not hasattr(self, 'environment_collection_file_path'):
+
+    def _update_centerline_arcs_time_series_collection(self, step_number: int):
+        """Update the centerline arcs time series collection file with new time step"""
+        if not hasattr(self, 'centerline_collection_file_path'):
             return
             
         # Read existing content
         try:
-            with open(self.environment_collection_file_path, 'r') as f:
+            with open(self.centerline_collection_file_path, 'r') as f:
                 lines = f.readlines()
         except:
             return
@@ -757,19 +1177,19 @@ class SalivaryGlandLJSimulation:
         if insert_index == -1:
             return
         
-        # Create the new entry for environment field
-        vts_file = f"salivary_gland_env_{step_number:04d}.vts"
-        new_entry = f'    <DataSet timestep="{self.time:.6f}" group="" part="0" file="{vts_file}"/>\n'
+        # Create the new entry for centerline arcs
+        vtm_file = f"centerline_arcs_{step_number:04d}.vtm"
+        new_entry = f'    <DataSet timestep="{self.time:.6f}" group="" part="0" file="{vtm_file}"/>\n'
         
         # Insert the new entry
         lines.insert(insert_index, new_entry)
         
         # Write back the updated file
-        with open(self.environment_collection_file_path, 'w') as f:
+        with open(self.centerline_collection_file_path, 'w') as f:
             for line in lines:
-                if '<!-- Salivary gland environment time series data will be added here -->' not in line:
+                if '<!-- Centerline arc time series data will be added here -->' not in line:
                     f.write(line)
-    
+
     def _write_paraview_state_file(self):
         """Write ParaView state file for automatic setup of salivary gland visualization"""
         state_file = os.path.join(self.output_dir, "salivary_gland_visualization_setup.pvsm")
@@ -844,29 +1264,112 @@ class SalivaryGlandLJSimulation:
         
         print(f"ParaView state file created: {state_file}")
     
-    def write_output(self, step_number: int):
-        """Write VTK files and state for current simulation step"""
-        # Write sporozoite centerlines
-        self._write_sporozoite_vtk(step_number)
+    def _create_bounding_box_vtk(self) -> vtk.vtkPolyData:
+        """Create bounding box for domain visualization"""
+        polydata = vtk.vtkPolyData()
         
-        # Write salivary gland environment field
-        self._write_salivary_gland_environment_vtk(step_number)
+        # Create bounding box vertices
+        points = vtk.vtkPoints()
+        # Bottom face (z=0)
+        points.InsertNextPoint(0, 0, 0)
+        points.InsertNextPoint(self.domain_size[0], 0, 0)
+        points.InsertNextPoint(self.domain_size[0], self.domain_size[1], 0)
+        points.InsertNextPoint(0, self.domain_size[1], 0)
+        # Top face (z=domain_size[2])
+        points.InsertNextPoint(0, 0, self.domain_size[2])
+        points.InsertNextPoint(self.domain_size[0], 0, self.domain_size[2])
+        points.InsertNextPoint(self.domain_size[0], self.domain_size[1], self.domain_size[2])
+        points.InsertNextPoint(0, self.domain_size[1], self.domain_size[2])
         
-        # Write simulation state info
-        self._write_simulation_state(step_number)
+        polydata.SetPoints(points)
         
-        # Initialize time series collection files (only once at the beginning)
-        if step_number == 0:
-            self._write_time_series_collection_files()
+        # Create wireframe lines for bounding box
+        lines = vtk.vtkCellArray()
+        # Bottom face edges
+        box_edges = [
+            [0, 1], [1, 2], [2, 3], [3, 0],  # Bottom face
+            [4, 5], [5, 6], [6, 7], [7, 4],  # Top face
+            [0, 4], [1, 5], [2, 6], [3, 7]   # Vertical edges
+        ]
         
-        # Update time series collections
-        self._update_sporozoites_time_series_collection(step_number)
-        self._update_environment_time_series_collection(step_number)
+        for edge in box_edges:
+            line = vtk.vtkLine()
+            line.GetPointIds().SetId(0, edge[0])
+            line.GetPointIds().SetId(1, edge[1])
+            lines.InsertNextCell(line)
         
-        # Write ParaView state file (only at the end)
-        if step_number == 0:
-            self._write_paraview_state_file()
+        polydata.SetLines(lines)
+        return polydata
     
+    def _create_center_point_vtk(self, sporozoite: SporozoiteCenterlineArc) -> vtk.vtkPolyData:
+        """Create center point representation for sporozoite"""
+        polydata = vtk.vtkPolyData()
+        
+        # Create single point at sporozoite center
+        points = vtk.vtkPoints()
+        center_pos = sporozoite.get_center_position()
+        points.InsertNextPoint(center_pos[0], center_pos[1], center_pos[2])
+        polydata.SetPoints(points)
+        
+        # Create vertex cell
+        vertices = vtk.vtkCellArray()
+        vertex = vtk.vtkVertex()
+        vertex.GetPointIds().SetId(0, 0)
+        vertices.InsertNextCell(vertex)
+        polydata.SetVerts(vertices)
+        
+        # Add scalar data
+        viability_array = vtk.vtkFloatArray()
+        viability_array.SetName("Viability")
+        viability_array.SetNumberOfTuples(1)
+        viability_array.SetValue(0, float(sporozoite.viability))
+        polydata.GetPointData().SetScalars(viability_array)
+        
+        return polydata
+    
+    def _create_centerline_arc_vtk(self, sporozoite: SporozoiteCenterlineArc) -> vtk.vtkPolyData:
+        """Create centerline arc representation for sporozoite"""
+        polydata = vtk.vtkPolyData()
+        
+        # Create points from nodes
+        points = vtk.vtkPoints()
+        for node in sporozoite.nodes:
+            points.InsertNextPoint(node.position[0], node.position[1], node.position[2])
+        polydata.SetPoints(points)
+        
+        # Create lines connecting nodes
+        lines = vtk.vtkCellArray()
+        for i in range(len(sporozoite.nodes) - 1):
+            line = vtk.vtkLine()
+            line.GetPointIds().SetId(0, i)
+            line.GetPointIds().SetId(1, i + 1)
+            lines.InsertNextCell(line)
+        polydata.SetLines(lines)
+        
+        # Add scalar data
+        num_nodes = len(sporozoite.nodes)
+        
+        # Viability
+        viability_array = vtk.vtkFloatArray()
+        viability_array.SetName("Viability")
+        viability_array.SetNumberOfTuples(num_nodes)
+        for i in range(num_nodes):
+            viability_array.SetValue(i, float(sporozoite.viability))
+        polydata.GetPointData().SetScalars(viability_array)
+        
+        # Node velocities
+        velocity_array = vtk.vtkFloatArray()
+        velocity_array.SetName("NodeVelocity")
+        velocity_array.SetNumberOfComponents(3)
+        velocity_array.SetNumberOfTuples(num_nodes)
+        for i, node in enumerate(sporozoite.nodes):
+            velocity_array.SetTuple3(i, 
+                                   float(node.velocity[0]),
+                                   float(node.velocity[1]), 
+                                   float(node.velocity[2]))
+        polydata.GetPointData().SetVectors(velocity_array)
+        
+        return polydata
 
     def run_simulation(self):
         """Run the complete LJ-based salivary gland simulation"""
@@ -925,10 +1428,30 @@ def main():
     
     # Create and run simulation
     sim = SalivaryGlandLJSimulation(
-        num_sporozoites=8,
+        num_sporozoites=10,
         domain_size=(50.0, 50.0, 10.0)
     )
     
+    # Estimate volume fraction
+    box_volume = sim.domain_size[0] * sim.domain_size[1] * sim.domain_size[2]
+    sporozoite_volume = 0.0
+
+    for sporozoite in sim.sporozoites:
+        if sporozoite.mesh_vertices is not None and sporozoite.mesh_faces is not None:
+            # Calculate volume of the sporozoite mesh using tetrahedrons
+            vertices = sporozoite.mesh_vertices
+            faces = sporozoite.mesh_faces
+            for face in faces:
+                if len(face) >= 3:
+                    # Use the first vertex as the origin for the tetrahedron
+                    v0 = vertices[face[0]]
+                    v1 = vertices[face[1]]
+                    v2 = vertices[face[2]]
+                    tetra_volume = np.abs(np.dot(v0, np.cross(v1, v2))) / 6.0
+                    sporozoite_volume += tetra_volume
+
+    volume_fraction = sporozoite_volume / box_volume
+    print(f"Estimated volume fraction: {volume_fraction:.6f}")
     output_dir = sim.run_simulation()
     
     print(f"\nSimulation complete! Check results in: {output_dir}")

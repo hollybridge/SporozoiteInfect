@@ -767,7 +767,18 @@ class MeshBasedSporozoiteSimulation:
     def _write_sporozoite_vtk(self, step_number: int):
         """Write sporozoite meshes to VTK with proper time information for animation"""
         multiblock = vtk.vtkMultiBlockDataSet()
-        multiblock.SetNumberOfBlocks(len(self.sporozoites))
+        
+        # Calculate total number of blocks: sporozoites + their components + bounding box
+        total_blocks = len(self.sporozoites) * 3 + 1  # 3 components per sporozoite + bounding box
+        multiblock.SetNumberOfBlocks(total_blocks)
+        
+        block_index = 0
+        
+        # Add bounding box as first block
+        bbox_polydata = self._create_bounding_box_vtk()
+        multiblock.SetBlock(block_index, bbox_polydata)
+        multiblock.GetMetaData(block_index).Set(vtk.vtkCompositeDataSet.NAME(), "BoundingBox")
+        block_index += 1
         
         for i, sporozoite in enumerate(self.sporozoites):
             # Validate sporozoite dimensions
@@ -790,28 +801,35 @@ class MeshBasedSporozoiteSimulation:
                     dimensions = bounds[1] - bounds[0]
                     print(f"      After restoration: [{dimensions[0]:.4f}, {dimensions[1]:.4f}, {dimensions[2]:.4f}]")
             
-            # Convert to VTK with validation
-            polydata = sporozoite.to_vtk_polydata()
+            # Create separate VTK components for this sporozoite
             
-            # Validate the polydata
-            if polydata.GetNumberOfPoints() == 0:
-                print(f"    ERROR: Sporozoite {sporozoite.id} has no points!")
-                continue
-            if polydata.GetNumberOfPolys() == 0:
-                print(f"    ERROR: Sporozoite {sporozoite.id} has no polygons!")
-                continue
+            # 1. Mesh body (full polydata)
+            mesh_polydata = sporozoite.to_vtk_polydata()
+            if mesh_polydata.GetNumberOfPoints() > 0:
+                # Add time information
+                time_array = vtk.vtkDoubleArray()
+                time_array.SetName("TimeValue")
+                time_array.SetNumberOfTuples(1)
+                time_array.SetValue(0, self.time)
+                mesh_polydata.GetFieldData().AddArray(time_array)
+                
+                multiblock.SetBlock(block_index, mesh_polydata)
+                multiblock.GetMetaData(block_index).Set(vtk.vtkCompositeDataSet.NAME(), f"Sporozoite_{sporozoite.id}_Mesh")
+                block_index += 1
             
-            print(f"    VTK Data: {polydata.GetNumberOfPoints()} points, {polydata.GetNumberOfPolys()} polys")
+            # 2. Center point
+            center_polydata = self._create_center_point_vtk(sporozoite)
+            multiblock.SetBlock(block_index, center_polydata)
+            multiblock.GetMetaData(block_index).Set(vtk.vtkCompositeDataSet.NAME(), f"Sporozoite_{sporozoite.id}_Center")
+            block_index += 1
             
-            # Add time information to each block as well
-            time_array_block = vtk.vtkDoubleArray()
-            time_array_block.SetName("TimeValue")
-            time_array_block.SetNumberOfTuples(1)
-            time_array_block.SetValue(0, self.time)
-            polydata.GetFieldData().AddArray(time_array_block)
+            # 3. Linear representation (simplified line)
+            linear_polydata = self._create_linear_representation_vtk(sporozoite)
+            multiblock.SetBlock(block_index, linear_polydata)
+            multiblock.GetMetaData(block_index).Set(vtk.vtkCompositeDataSet.NAME(), f"Sporozoite_{sporozoite.id}_Linear")
+            block_index += 1
             
-            multiblock.SetBlock(i, polydata)
-            multiblock.GetMetaData(i).Set(vtk.vtkCompositeDataSet.NAME(), f"Sporozoite_{sporozoite.id}")
+            print(f"    Added sporozoite {sporozoite.id} with 3 components to multiblock")
         
         # Write to file with proper format settings
         filename = os.path.join(self.output_dir, f"sporozoites_{step_number:04d}.vtm")
@@ -823,239 +841,189 @@ class MeshBasedSporozoiteSimulation:
         writer.SetCompressorTypeToNone()  # Disable compression to avoid binary issues
         writer.Write()
         
-        print(f"VTK DEBUG: Successfully wrote {filename}")
+        print(f"VTK DEBUG: Successfully wrote {filename} with {block_index} blocks")
         
         # Update the time series collection file
         self._update_sporozoites_time_series_collection(step_number)
 
-    def _write_tissue_field_vtk(self, step_number: int):
-        """Write tissue field data to VTK with proper time information for animation"""
-        field_data = self.tissue_field.get_field_visualization_data()
-        X, Y, Z = field_data['coordinates']
+    def _create_bounding_box_vtk(self) -> vtk.vtkPolyData:
+        """Create VTK representation of simulation domain bounding box"""
+        polydata = vtk.vtkPolyData()
         
-        # Create structured grid
-        grid = vtk.vtkStructuredGrid()
-        grid.SetDimensions(*self.tissue_field.grid_resolution)
+        # Define the 8 corners of the domain box
+        corners = [
+            [0, 0, 0],  # 0
+            [self.domain_size[0], 0, 0],  # 1
+            [self.domain_size[0], self.domain_size[1], 0],  # 2
+            [0, self.domain_size[1], 0],  # 3
+            [0, 0, self.domain_size[2]],  # 4
+            [self.domain_size[0], 0, self.domain_size[2]],  # 5
+            [self.domain_size[0], self.domain_size[1], self.domain_size[2]],  # 6
+            [0, self.domain_size[1], self.domain_size[2]]  # 7
+        ]
         
-        # Add time information to the dataset
+        # Create points
+        points = vtk.vtkPoints()
+        for corner in corners:
+            points.InsertNextPoint(corner[0], corner[1], corner[2])
+        polydata.SetPoints(points)
+        
+        # Create lines for box edges
+        lines = vtk.vtkCellArray()
+        edges = [
+            [0, 1], [1, 2], [2, 3], [3, 0],  # Bottom face
+            [4, 5], [5, 6], [6, 7], [7, 4],  # Top face
+            [0, 4], [1, 5], [2, 6], [3, 7]   # Vertical edges
+        ]
+        
+        for edge in edges:
+            line = vtk.vtkLine()
+            line.GetPointIds().SetId(0, edge[0])
+            line.GetPointIds().SetId(1, edge[1])
+            lines.InsertNextCell(line)
+        polydata.SetLines(lines)
+        
+        # Add time information
         time_array = vtk.vtkDoubleArray()
         time_array.SetName("TimeValue")
         time_array.SetNumberOfTuples(1)
         time_array.SetValue(0, self.time)
-        grid.GetFieldData().AddArray(time_array)
+        polydata.GetFieldData().AddArray(time_array)
         
-        # Add points
-        points = vtk.vtkPoints()
-        for k in range(X.shape[2]):
-            for j in range(X.shape[1]):
-                for i in range(X.shape[0]):
-                    points.InsertNextPoint(X[i,j,k], Y[i,j,k], Z[i,j,k])
-        grid.SetPoints(points)
+        # Add domain information as scalar data
+        domain_array = vtk.vtkFloatArray()
+        domain_array.SetName("DomainBoundary")
+        domain_array.SetNumberOfTuples(len(corners))
+        for i in range(len(corners)):
+            domain_array.SetValue(i, 1.0)  # Constant value indicating boundary
+        polydata.GetPointData().SetScalars(domain_array)
         
-        # Add scalar fields - fix the array creation and ordering
-        # Collagen density
-        collagen_array = vtk.vtkFloatArray()
-        collagen_array.SetName("CollagenDensity")
-        collagen_array.SetNumberOfTuples(grid.GetNumberOfPoints())
-        collagen_data = field_data['collagen_density']
-        point_index = 0
-        for k in range(collagen_data.shape[2]):
-            for j in range(collagen_data.shape[1]):
-                for i in range(collagen_data.shape[0]):
-                    collagen_array.SetValue(point_index, float(collagen_data[i,j,k]))
-                    point_index += 1
-        grid.GetPointData().SetScalars(collagen_array)
-        
-        # Immune cell density
-        immune_array = vtk.vtkFloatArray()
-        immune_array.SetName("ImmuneCellDensity")
-        immune_array.SetNumberOfTuples(grid.GetNumberOfPoints())
-        immune_data = field_data['immune_cells']
-        point_index = 0
-        for k in range(immune_data.shape[2]):
-            for j in range(immune_data.shape[1]):
-                for i in range(immune_data.shape[0]):
-                    immune_array.SetValue(point_index, float(immune_data[i,j,k]))
-                    point_index += 1
-        grid.GetPointData().AddArray(immune_array)
-        
-        # Pressure field
-        pressure_array = vtk.vtkFloatArray()
-        pressure_array.SetName("Pressure")
-        pressure_array.SetNumberOfTuples(grid.GetNumberOfPoints())
-        pressure_data = field_data['pressure']
-        point_index = 0
-        for k in range(pressure_data.shape[2]):
-            for j in range(pressure_data.shape[1]):
-                for i in range(pressure_data.shape[0]):
-                    pressure_array.SetValue(point_index, float(pressure_data[i,j,k]))
-                    point_index += 1
-        grid.GetPointData().AddArray(pressure_array)
-        
-        # Flow field (vector)
-        flow_array = vtk.vtkFloatArray()
-        flow_array.SetName("FlowField")
-        flow_array.SetNumberOfComponents(3)
-        flow_array.SetNumberOfTuples(grid.GetNumberOfPoints())
-        flow_data = field_data['flow_field']
-        point_index = 0
-        for k in range(flow_data.shape[2]):
-            for j in range(flow_data.shape[1]):
-                for i in range(flow_data.shape[0]):
-                    flow_array.SetTuple3(point_index, 
-                                        float(flow_data[i,j,k,0]), 
-                                        float(flow_data[i,j,k,1]), 
-                                        float(flow_data[i,j,k,2]))
-                    point_index += 1
-        grid.GetPointData().SetVectors(flow_array)
-        
-        # Write tissue field with proper format settings
-        filename = os.path.join(self.output_dir, f"tissue_field_{step_number:04d}.vts")
-        writer = vtk.vtkXMLStructuredGridWriter()
-        writer.SetFileName(filename)
-        writer.SetInputData(grid)
-        writer.SetDataModeToAscii()  # Use ASCII format for better compatibility
-        writer.SetCompressorTypeToNone()  # Disable compression to avoid binary issues
-        writer.Write()
+        return polydata
 
-    def _write_blood_flow_field_vtk(self, step_number: int):
-        """Write blood flow field data to VTK with proper time information for animation"""
-        field_data = self.environment_field.get_field_visualization_data()
-        X, Y, Z = field_data['coordinates']
+    def _create_center_point_vtk(self, sporozoite) -> vtk.vtkPolyData:
+        """Create VTK representation of sporozoite center point"""
+        polydata = vtk.vtkPolyData()
         
-        # Create structured grid
-        grid = vtk.vtkStructuredGrid()
-        grid.SetDimensions(*self.environment_field.grid_resolution)
+        # Single point at center
+        points = vtk.vtkPoints()
+        points.InsertNextPoint(sporozoite.center_position[0], 
+                              sporozoite.center_position[1], 
+                              sporozoite.center_position[2])
+        polydata.SetPoints(points)
         
-        # Add time information to the dataset
+        # Create vertex cell
+        verts = vtk.vtkCellArray()
+        vertex = vtk.vtkVertex()
+        vertex.GetPointIds().SetId(0, 0)
+        verts.InsertNextCell(vertex)
+        polydata.SetVerts(verts)
+        
+        # Add time information
         time_array = vtk.vtkDoubleArray()
         time_array.SetName("TimeValue")
         time_array.SetNumberOfTuples(1)
         time_array.SetValue(0, self.time)
-        grid.GetFieldData().AddArray(time_array)
+        polydata.GetFieldData().AddArray(time_array)
         
-        # Add points
-        points = vtk.vtkPoints()
-        for k in range(X.shape[2]):
-            for j in range(X.shape[1]):
-                for i in range(X.shape[0]):
-                    points.InsertNextPoint(X[i,j,k], Y[i,j,k], Z[i,j,k])
-        grid.SetPoints(points)
+        # Add sporozoite properties as scalar data
+        # Viability (primary scalar for coloring)
+        viability_array = vtk.vtkFloatArray()
+        viability_array.SetName("Viability")
+        viability_array.SetNumberOfTuples(1)
+        viability_array.SetValue(0, float(sporozoite.viability))
+        polydata.GetPointData().SetScalars(viability_array)
         
-        # Add blood flow specific fields
-        # Velocity magnitude (scalar)
-        velocity_magnitude_array = vtk.vtkFloatArray()
-        velocity_magnitude_array.SetName("VelocityMagnitude")
-        velocity_magnitude_array.SetNumberOfTuples(grid.GetNumberOfPoints())
-        velocity_data = field_data['velocity_field']
-        point_index = 0
-        for k in range(velocity_data.shape[2]):
-            for j in range(velocity_data.shape[1]):
-                for i in range(velocity_data.shape[0]):
-                    vel_mag = np.linalg.norm(velocity_data[i,j,k,:])
-                    velocity_magnitude_array.SetValue(point_index, float(vel_mag))
-                    point_index += 1
-        grid.GetPointData().SetScalars(velocity_magnitude_array)
+        # Motility
+        motility_array = vtk.vtkFloatArray()
+        motility_array.SetName("Motility")
+        motility_array.SetNumberOfTuples(1)
+        motility_array.SetValue(0, float(sporozoite.motility))
+        polydata.GetPointData().AddArray(motility_array)
         
-        # Pressure field
-        pressure_array = vtk.vtkFloatArray()
-        pressure_array.SetName("Pressure")
-        pressure_array.SetNumberOfTuples(grid.GetNumberOfPoints())
-        pressure_data = field_data['pressure']
-        point_index = 0
-        for k in range(pressure_data.shape[2]):
-            for j in range(pressure_data.shape[1]):
-                for i in range(pressure_data.shape[0]):
-                    pressure_array.SetValue(point_index, float(pressure_data[i,j,k]))
-                    point_index += 1
-        grid.GetPointData().AddArray(pressure_array)
+        # Sporozoite ID
+        id_array = vtk.vtkIntArray()
+        id_array.SetName("SporozoiteID")
+        id_array.SetNumberOfTuples(1)
+        id_array.SetValue(0, int(sporozoite.id))
+        polydata.GetPointData().AddArray(id_array)
         
-        # Shear rate field
-        shear_rate_array = vtk.vtkFloatArray()
-        shear_rate_array.SetName("ShearRate")
-        shear_rate_array.SetNumberOfTuples(grid.GetNumberOfPoints())
-        shear_rate_data = field_data['shear_rate']
-        point_index = 0
-        for k in range(shear_rate_data.shape[2]):
-            for j in range(shear_rate_data.shape[1]):
-                for i in range(shear_rate_data.shape[0]):
-                    shear_rate_array.SetValue(point_index, float(shear_rate_data[i,j,k]))
-                    point_index += 1
-        grid.GetPointData().AddArray(shear_rate_array)
-        
-        # Turbulence intensity field (if available)
-        if 'turbulence_intensity' in field_data:
-            turbulence_array = vtk.vtkFloatArray()
-            turbulence_array.SetName("TurbulenceIntensity")
-            turbulence_array.SetNumberOfTuples(grid.GetNumberOfPoints())
-            turbulence_data = field_data['turbulence_intensity']
-            point_index = 0
-            for k in range(turbulence_data.shape[2]):
-                for j in range(turbulence_data.shape[1]):
-                    for i in range(turbulence_data.shape[0]):
-                        turbulence_array.SetValue(point_index, float(turbulence_data[i,j,k]))
-                        point_index += 1
-            grid.GetPointData().AddArray(turbulence_array)
-        
-        # Velocity field (vector)
-        velocity_vector_array = vtk.vtkFloatArray()
-        velocity_vector_array.SetName("Velocity")
-        velocity_vector_array.SetNumberOfComponents(3)
-        velocity_vector_array.SetNumberOfTuples(grid.GetNumberOfPoints())
-        point_index = 0
-        for k in range(velocity_data.shape[2]):
-            for j in range(velocity_data.shape[1]):
-                for i in range(velocity_data.shape[0]):
-                    velocity_vector_array.SetTuple3(point_index, 
-                                                  float(velocity_data[i,j,k,0]), 
-                                                  float(velocity_data[i,j,k,1]), 
-                                                  float(velocity_data[i,j,k,2]))
-                    point_index += 1
-        grid.GetPointData().SetVectors(velocity_vector_array)
-        
-        # Add flow type and parameters as field data
-        flow_type_array = vtk.vtkStringArray()
-        flow_type_array.SetName("FlowType")
-        flow_type_array.SetNumberOfTuples(1)
-        flow_type_array.SetValue(0, field_data['flow_type'])
-        grid.GetFieldData().AddArray(flow_type_array)
-        
-        # Write blood flow field with proper format settings
-        filename = os.path.join(self.output_dir, f"blood_flow_field_{step_number:04d}.vts")
-        writer = vtk.vtkXMLStructuredGridWriter()
-        writer.SetFileName(filename)
-        writer.SetInputData(grid)
-        writer.SetDataModeToAscii()  # Use ASCII format for better compatibility
-        writer.SetCompressorTypeToNone()  # Disable compression to avoid binary issues
-        writer.Write()
+        return polydata
 
-    def _write_presets_config_file(self):
-        """Write comprehensive presets configuration file with all available options"""
-        # Placeholder for writing presets configuration file
-        pass
+    def _create_linear_representation_vtk(self, sporozoite) -> vtk.vtkPolyData:
+        """Create simplified linear representation of sporozoite"""
+        polydata = vtk.vtkPolyData()
+        
+        # Create a simple line from tail to head based on sporozoite direction
+        direction_vec = np.array([np.cos(sporozoite.direction), np.sin(sporozoite.direction), 0])
+        half_length = sporozoite.length / 2
+        
+        tail_pos = sporozoite.center_position - direction_vec * half_length
+        head_pos = sporozoite.center_position + direction_vec * half_length
+        
+        # Create points
+        points = vtk.vtkPoints()
+        points.InsertNextPoint(tail_pos[0], tail_pos[1], tail_pos[2])
+        points.InsertNextPoint(head_pos[0], head_pos[1], head_pos[2])
+        polydata.SetPoints(points)
+        
+        # Create line
+        lines = vtk.vtkCellArray()
+        line = vtk.vtkLine()
+        line.GetPointIds().SetId(0, 0)
+        line.GetPointIds().SetId(1, 1)
+        lines.InsertNextCell(line)
+        polydata.SetLines(lines)
+        
+        # Add time information
+        time_array = vtk.vtkDoubleArray()
+        time_array.SetName("TimeValue")
+        time_array.SetNumberOfTuples(1)
+        time_array.SetValue(0, self.time)
+        polydata.GetFieldData().AddArray(time_array)
+        
+        # Add sporozoite properties as scalar data for both points
+        # Viability
+        viability_array = vtk.vtkFloatArray()
+        viability_array.SetName("Viability")
+        viability_array.SetNumberOfTuples(2)
+        viability_array.SetValue(0, float(sporozoite.viability))
+        viability_array.SetValue(1, float(sporozoite.viability))
+        polydata.GetPointData().SetScalars(viability_array)
+        
+        # Motility
+        motility_array = vtk.vtkFloatArray()
+        motility_array.SetName("Motility")
+        motility_array.SetNumberOfTuples(2)
+        motility_array.SetValue(0, float(sporozoite.motility))
+        motility_array.SetValue(1, float(sporozoite.motility))
+        polydata.GetPointData().AddArray(motility_array)
+        
+        # Sporozoite ID
+        id_array = vtk.vtkIntArray()
+        id_array.SetName("SporozoiteID")
+        id_array.SetNumberOfTuples(2)
+        id_array.SetValue(0, int(sporozoite.id))
+        id_array.SetValue(1, int(sporozoite.id))
+        polydata.GetPointData().AddArray(id_array)
+        
+        return polydata
 
     def write_vtk_output(self, step_number: int):
-        """Write VTK files for current simulation state"""
-        # Write sporozoite meshes
+        """Write VTK files for current simulation state - SIMPLIFIED VERSION"""
+        # Only write sporozoite data (with bounding box included)
         self._write_sporozoite_vtk(step_number)
         
-        # Write environment field data (tissue or blood flow)
-        if self.use_blood_flow:
-            self._write_blood_flow_field_vtk(step_number)
-        else:
-            self._write_tissue_field_vtk(step_number)
+        # Skip separate environment and state files
+        # Skip: self._write_blood_flow_field_vtk(step_number)
+        # Skip: self._write_tissue_field_vtk(step_number) 
+        # Skip: self._write_simulation_state(step_number)
         
-        # Write simulation state info
-        self._write_simulation_state(step_number)
-        
-        # Write presets configuration file (only once at the beginning)
+        # Initialize collection files only once at the beginning
         if step_number == 0:
-            self._write_presets_config_file()
             self._write_time_series_collection_files()
         
-        # Update time series collections
+        # Only update sporozoites collection (no environment collection)
         self._update_sporozoites_time_series_collection(step_number)
-        self._update_environment_time_series_collection(step_number)
 
     def run_simulation(self):
         """Run the complete mesh-based simulation"""
